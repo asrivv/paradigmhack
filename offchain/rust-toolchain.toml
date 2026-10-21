@@ -1,0 +1,4 @@
+# Upstream pins no rust-toolchain file at the pinned rev; its workspace declares
+# rust-version = "1.95.0", which is the toolchain its MSRV CI job builds with.
+[toolchain]
+channel = "1.95.0"

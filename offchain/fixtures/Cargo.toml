@@ -1,0 +1,26 @@
+[package]
+name = "bajillion-fixtures"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+blst.workspace = true
+bytes.workspace = true
+commonware-clearing = { workspace = true, features = ["std"] }
+commonware-codec = { workspace = true, features = ["std"] }
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography-curve25519 = { workspace = true, features = ["std"] }
+commonware-parallel = { workspace = true, features = ["std"] }
+commonware-runtime.workspace = true
+commonware-storage = { workspace = true, features = ["std"] }
+commonware-utils = { workspace = true, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Independent implementations, so the test checks contract-facing bytes without
+# trusting the commonware wrappers that produced them.
+ed25519-consensus.workspace = true
+sha2.workspace = true

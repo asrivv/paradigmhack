@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["fixtures"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95.0"
+publish = false
+
+# Every upstream crate is pinned to the head of commonwarexyz/monorepo PR #4664. The clearing
+# crate only exists on that ref, and the contract fixtures must match its byte formats exactly,
+# so all commonware crates come from the same commit to avoid mixing codec versions.
+[workspace.dependencies]
+commonware-clearing = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
+commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
+commonware-storage = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
+# The upstream test and terminal helpers sign accounts with this crate's ed25519 keys and use
+# the sequential strategy and seeded RNG from these two crates.
+commonware-cryptography-curve25519 = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
+commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
+# Same versions the upstream workspace locks.
+blst = { version = "0.3.16", default-features = false }
+bytes = "1.12.1"
+ed25519-consensus = "2.1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
