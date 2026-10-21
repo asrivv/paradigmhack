@@ -31,3 +31,5 @@ bracket_spacing = true
 # Style notes only. Immutables keep the crate's field names so the port reads against
 # settlement.rs; struct literals mirror Rust tuple construction.
 exclude_lints = ["screaming-snake-case-immutable", "named-struct-fields", "asm-keccak256"]
+# Test helpers and temporary vectors are not linted.
+ignore = ["test/**/*.sol"]

@@ -896,7 +896,9 @@ contract BajillionSettlement {
         (bytes calldata records, uint256 count, uint64 depositTotal) = _decodeDeposits(a.deposits);
         _requireEmptyWithdrawals(a.withdrawals);
         if (Vector.depositRoot(records, count) != rec.depositRoot || Vector.emptyWithdrawalRoot() != rec.withdrawalRoot)
-        revert TransitionBoundaryRoot();
+        {
+            revert TransitionBoundaryRoot();
+        }
         // limits: max_states, max_rows, max_withdrawals, max_account_entries, max_total_entries,
         // max_payment_total, max_deposit_total, max_withdrawal_total.
         if (a.withdrawalTotal > rec.limits[7]) revert TransitionCloseLimit();
@@ -1067,7 +1069,7 @@ contract BajillionSettlement {
     /// @dev Resolve the neighbours of `index` from the ordered list and run `ClaimedRange::insert`
     /// (settlement.rs:501-521) on them. A neighbour with `end == 0` is absent.
     function _planClaim(uint64 index, uint64 predecessor)
-        private
+        internal
         view
         returns (
             bool ok,
@@ -1110,7 +1112,7 @@ contract BajillionSettlement {
         uint64 start,
         uint64 end,
         ClaimedRange memory succ
-    ) private {
+    ) internal {
         bool mergeAfter = afterStart != 0 && afterStart == index + 1;
         uint64 next = mergeAfter ? succ.next : afterStart;
         if (predecessor != 0 && start == predecessor) {

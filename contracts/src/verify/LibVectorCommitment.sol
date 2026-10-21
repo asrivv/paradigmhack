@@ -19,6 +19,7 @@ library LibVectorCommitment {
 
     /// @dev Encoded `DepositRecord` width: 32-byte account and u64 amount (boundary.rs:59-68).
     uint256 internal constant DEPOSIT_RECORD_SIZE = 40;
+    uint64 internal constant DEPOSIT_RECORD_LENGTH = 40;
 
     /// @notice Root of a deposit vector whose `count` records are packed in `records`.
     /// @dev The caller bounds `count` and checks `records.length == count * 40`.
@@ -27,20 +28,12 @@ library LibVectorCommitment {
         if (count == 0) {
             level[0] = sha256("");
         } else {
-            for (uint256 i; i < count; ++i) {
+            // forge-lint: disable-next-line(unsafe-typecast) callers bound count by MAX_VECTOR_LENGTH (2^24)
+            uint32 n = uint32(count);
+            for (uint32 i; i < n; ++i) {
                 bytes calldata encoded = records[i * DEPOSIT_RECORD_SIZE:(i + 1) * DEPOSIT_RECORD_SIZE];
-                bytes32 element = sha256(
-                    abi.encodePacked(
-                        // forge-lint: disable-next-line(unsafe-typecast) bounded by the checks above
-                        DEPOSIT_LEAF_DOMAIN,
-                        uint32(count),
-                        uint32(i),
-                        uint64(DEPOSIT_RECORD_SIZE),
-                        encoded
-                    )
-                );
-                // forge-lint: disable-next-line(unsafe-typecast) bounded by the checks above
-                level[i] = sha256(abi.encodePacked(uint32(i), element));
+                bytes32 element = sha256(abi.encodePacked(DEPOSIT_LEAF_DOMAIN, n, i, DEPOSIT_RECORD_LENGTH, encoded));
+                level[i] = sha256(abi.encodePacked(i, element));
             }
         }
         return _bind(DEPOSIT_ROOT_DOMAIN, count, _treeRoot(level));
