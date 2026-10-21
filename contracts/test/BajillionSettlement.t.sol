@@ -334,6 +334,32 @@ contract BajillionSettlementTest is SettlementBase {
         assertEq(settlement.pendingDeposits(bytes32(uint256(7))), 10, "deposit stays refundable");
     }
 
+    /// @dev deposit and registerEpoch also return a status, without moving tokens, when they are
+    /// the call that observes the expiry.
+    function test_Inv07_DepositAndRegisterReturnStatusOnFence() public {
+        _register(0);
+        token.mint(address(this), 10);
+        token.approve(address(settlement), 10);
+        uint256 snap = vm.snapshotState();
+
+        vm.warp(_admissionDeadline(0) + 1);
+        (BajillionSettlement.Status s, uint64 index) = settlement.deposit(bytes32(uint256(1)), 10);
+        assertEq(uint8(s), uint8(BajillionSettlement.Status.OperatorHardFaulted));
+        assertEq(index, 0);
+        assertEq(token.balanceOf(address(this)), 10, "no tokens pulled");
+        assertEq(settlement.intake(), 0);
+        assertEq(uint8(settlement.faultKind()), uint8(BajillionSettlement.FaultKind.ExpiredRegistration));
+
+        vm.revertToState(snap);
+        bytes memory ctx = _epochContext(1, hex"00");
+        vm.warp(_admissionDeadline(0) + 1);
+        assertEq(
+            uint8(settlement.registerEpoch(ctx, 0, hex"00", hex"00", "")),
+            uint8(BajillionSettlement.Status.OperatorHardFaulted)
+        );
+        assertEq(settlement.registeredEnd(), 0);
+    }
+
     function test_Inv07_FaultExpiredFencesExplicitly() public {
         _register(0);
         vm.warp(_admissionDeadline(0) + 1);
