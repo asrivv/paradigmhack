@@ -99,6 +99,64 @@ contract FixtureChallengeTest is Test {
         assertEq(uint8(v), uint8(BajillionSettlement.Verdict.ProvenAckFork));
     }
 
+    // ---- HigherAckDebit (challenge.rs:636-672) ------------------------------------------------
+
+    function test_HigherAckDebitProven() public {
+        (BajillionSettlement.Status s, BajillionSettlement.Verdict v) = _challenge("challenge_higher_ack_debit_proven");
+        assertEq(uint8(s), uint8(BajillionSettlement.Status.Ok));
+        assertEq(uint8(v), uint8(BajillionSettlement.Verdict.ProvenHigherAckDebit));
+        assertEq(settlement.epochRecord(1).status, 3);
+        assertEq(settlement.epochRecord(1).challengeKind, 0, "HigherAckDebit tag");
+        assertEq(uint8(settlement.faultKind()), uint8(BajillionSettlement.FaultKind.ProvenChallenge));
+    }
+
+    function test_HigherAckDebitNoContradiction() public {
+        (BajillionSettlement.Status s, BajillionSettlement.Verdict v) =
+            _challenge("challenge_higher_ack_debit_no_contradiction");
+        assertEq(uint8(s), uint8(BajillionSettlement.Status.Ok));
+        assertEq(uint8(v), uint8(BajillionSettlement.Verdict.NoContradiction));
+        _assertUnchallenged();
+    }
+
+    /// @dev `AckWitness::reconstruct` checks the payer signature under the send namespace first
+    /// (challenge.rs:64-94): a payer signature made under the ack namespace is InvalidPayerSignature.
+    function test_HigherAckDebitWrongPayerRoleRejected() public {
+        bytes memory encoded = Fixture.hexFile("challenge_higher_ack_debit_wrong_payer_role");
+        vm.expectRevert(BajillionSettlement.ChallengeInvalidPayerSignature.selector);
+        settlement.challenge(batchId, context, roots, total, encoded);
+        _assertUnchallenged();
+    }
+
+    /// @dev Tampering with the activity opening or the claimed terminal value fails the proof.
+    function test_HigherAckDebitRejectsForgedActivityOpening() public {
+        bytes memory proven = Fixture.hexFile("challenge_higher_ack_debit_proven");
+        // Layout: tag(1) || AckWitness(240) || lookup tag(1) || ChangeValue(48) || Opening.
+        bytes memory forged = bytes.concat(proven);
+        forged[1 + 240 + 1 + 7] ^= 0x01; // terminal debit in the change value
+        vm.expectRevert(BajillionSettlement.ChallengeActivity.selector);
+        settlement.challenge(batchId, context, roots, total, forged);
+        forged = bytes.concat(proven);
+        forged[forged.length - 1] ^= 0x01; // last proof digest
+        vm.expectRevert(BajillionSettlement.ChallengeActivity.selector);
+        settlement.challenge(batchId, context, roots, total, forged);
+        forged = bytes.concat(proven);
+        forged[1 + 240 + 1 + 48 + 7] = 0x09; // opening start 9 lies outside the epoch rows [1, 5)
+        vm.expectRevert(BajillionSettlement.ChallengeLookupOrder.selector);
+        settlement.challenge(batchId, context, roots, total, forged);
+        _assertUnchallenged();
+    }
+
+    function test_GasFixtureChallenges() public {
+        uint256 snap = vm.snapshotState();
+        bytes memory fork = Fixture.hexFile("challenge_ack_fork_proven");
+        settlement.challenge(batchId, context, roots, total, fork);
+        vm.snapshotGasLastCall("Challenges", "challenge_fixture_ackFork_proven");
+        vm.revertToState(snap);
+        bytes memory debit = Fixture.hexFile("challenge_higher_ack_debit_proven");
+        settlement.challenge(batchId, context, roots, total, debit);
+        vm.snapshotGasLastCall("Challenges", "challenge_fixture_higherAckDebit_proven");
+    }
+
     // ---- Witness, encoding and timing ---------------------------------------------------------
 
     function test_RejectsWrongHeaderWitness() public {

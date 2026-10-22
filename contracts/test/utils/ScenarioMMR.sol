@@ -93,40 +93,58 @@ library ScenarioMMR {
     }
 
     function proof(bytes[] memory ops, uint256 inactive, uint256 loc) internal pure returns (bytes32[] memory) {
+        return rangeProof(ops, inactive, loc, 1);
+    }
+
+    /// @dev Range proof for `[start, start + count)` in the layout of storage/src/merkle/proof.rs:
+    /// `[fold_acc? | prefix_active_peaks | after_peaks | suffix_acc? | siblings]`, BackwardFold.
+    function rangeProof(bytes[] memory ops, uint256 inactive, uint256 start, uint256 count)
+        internal
+        pure
+        returns (bytes32[] memory)
+    {
+        uint256 end = start + count;
         (uint256[] memory starts, uint256[] memory heights) = peaks(ops.length);
-        bytes32[] memory out = new bytes32[](128);
+        bytes32[] memory out = new bytes32[](256);
         uint256 len;
-        uint256 k;
-        while (!(loc >= starts[k] && loc < starts[k] + (1 << heights[k]))) {
-            ++k;
-        }
-        // Fold prefix: inactive peaks before the target.
         bool folded;
         bytes32 acc;
-        for (uint256 i; i < k && i < inactive; ++i) {
-            bytes32 d = node(ops, starts[i], heights[i]);
-            acc = folded ? sha256(abi.encodePacked(acc, d)) : d;
-            folded = true;
+        // Peaks wholly before the range: inactive ones fold, active ones are listed.
+        for (uint256 i; i < starts.length; ++i) {
+            if (starts[i] + (1 << heights[i]) <= start && i < inactive) {
+                bytes32 d = node(ops, starts[i], heights[i]);
+                acc = folded ? sha256(abi.encodePacked(acc, d)) : d;
+                folded = true;
+            }
         }
         if (folded) out[len++] = acc;
-        // Active peaks before the target, individually.
-        for (uint256 i = inactive; i < k; ++i) {
-            out[len++] = node(ops, starts[i], heights[i]);
+        for (uint256 i; i < starts.length; ++i) {
+            if (starts[i] + (1 << heights[i]) <= start && i >= inactive) out[len++] = node(ops, starts[i], heights[i]);
         }
-        // Inactive peaks after the target, individually.
-        for (uint256 i = k + 1; i < starts.length && i < inactive; ++i) {
-            out[len++] = node(ops, starts[i], heights[i]);
+        // Peaks wholly after the range: inactive ones listed, active ones collapse backward.
+        for (uint256 i; i < starts.length; ++i) {
+            if (starts[i] >= end && i < inactive) out[len++] = node(ops, starts[i], heights[i]);
         }
-        // Active peaks after the target, collapsed by backward folding.
-        uint256 suffixStart = k + 1 > inactive ? k + 1 : inactive;
-        if (suffixStart < starts.length) {
-            bytes32 bag = node(ops, starts[starts.length - 1], heights[starts.length - 1]);
-            for (uint256 j = starts.length - 1; j > suffixStart; --j) {
-                bag = sha256(abi.encodePacked(node(ops, starts[j - 1], heights[j - 1]), bag));
+        {
+            bool haveSuffix;
+            bytes32 bag;
+            for (uint256 j = starts.length; j > 0; --j) {
+                uint256 i = j - 1;
+                if (starts[i] >= end && i >= inactive) {
+                    bytes32 d = node(ops, starts[i], heights[i]);
+                    bag = haveSuffix ? sha256(abi.encodePacked(d, bag)) : d;
+                    haveSuffix = true;
+                }
             }
-            out[len++] = bag;
+            if (haveSuffix) out[len++] = bag;
         }
-        len = _siblings(ops, starts[k], heights[k], loc, out, len);
+        // Siblings of every peak that overlaps the range, in left-first DFS order.
+        for (uint256 i; i < starts.length; ++i) {
+            uint256 peakEnd = starts[i] + (1 << heights[i]);
+            if (peakEnd > start && starts[i] < end) {
+                len = _rangeSiblings(ops, starts[i], heights[i], start, end, out, len);
+            }
+        }
         bytes32[] memory trimmed = new bytes32[](len);
         for (uint256 i; i < len; ++i) {
             trimmed[i] = out[i];
@@ -134,25 +152,25 @@ library ScenarioMMR {
         return trimmed;
     }
 
-    /// @dev Left-first DFS siblings (storage/src/merkle/proof.rs:610-625).
-    function _siblings(
+    /// @dev `Subtree::collect_siblings` (storage/src/merkle/proof.rs:610-625).
+    function _rangeSiblings(
         bytes[] memory ops,
-        uint256 start,
+        uint256 subStart,
         uint256 height,
-        uint256 loc,
+        uint256 start,
+        uint256 end,
         bytes32[] memory out,
         uint256 len
     ) private pure returns (uint256) {
-        if (height == 0) return len;
-        uint256 half = 1 << (height - 1);
-        if (loc < start + half) {
-            len = _siblings(ops, start, height - 1, loc, out, len);
-            out[len++] = node(ops, start + half, height - 1);
-        } else {
-            out[len++] = node(ops, start, height - 1);
-            len = _siblings(ops, start + half, height - 1, loc, out, len);
+        uint256 subEnd = subStart + (1 << height);
+        if (subEnd <= start || subStart >= end) {
+            out[len++] = node(ops, subStart, height);
+            return len;
         }
-        return len;
+        if (subStart >= start && subEnd <= end) return len;
+        uint256 half = 1 << (height - 1);
+        len = _rangeSiblings(ops, subStart, height - 1, start, end, out, len);
+        return _rangeSiblings(ops, subStart + half, height - 1, start, end, out, len);
     }
 
     /// @dev The crate's `WithdrawalClaim` encoding (transition.rs:1024-1029, logs.rs:435-440,

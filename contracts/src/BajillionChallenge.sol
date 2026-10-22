@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pragma solidity ^0.8.36;
 
+import { LibMerkle } from "commonware/merkle/LibMerkle.sol";
+import { LibQMDBCommon } from "commonware/qmdb/LibQMDBCommon.sol";
 import { LibClearingCodec as Codec } from "./verify/LibClearingCodec.sol";
 import { Ed25519Verifier } from "./verify/LibEd25519.sol";
 
@@ -14,9 +16,8 @@ import { Ed25519Verifier } from "./verify/LibEd25519.sol";
 /// reverted, because the caller may already have committed the liveness fence and must then
 /// return a status instead of reverting (settlement.rs:3-12). A zero selector means success.
 ///
-/// Scope: `AckFork` is adjudicated. `HigherAckDebit` decodes but is not yet adjudicated, and
-/// `HigherAckEntry` is rejected with `ChallengeKindUnsupported` until its edge-vector proofs are
-/// ported.
+/// Scope: `HigherAckDebit` and `AckFork` are adjudicated. `HigherAckEntry` decodes as a kind but is
+/// rejected with `ChallengeKindUnsupported` until its edge-vector proofs are ported.
 library BajillionChallenge {
     // ChallengeKind (challenge.rs:595-603), with the settlement codec tags of settlement.rs:2227-2233.
     uint8 internal constant HIGHER_ACK_DEBIT = 0;
@@ -200,7 +201,12 @@ library BajillionChallenge {
         uint256 start = Codec.readU64(context, 328);
         uint256 rowCount = Codec.readU64(roots, 48);
         uint256 end = start + rowCount;
+        // Upstream's `checked_add` fails on overflow; here `rangeValid` requires
+        // `end < headOperations <= 2^62`, so a truncated value is only ever paired with
+        // `rangeValid == false`, which is rejected before the range is used.
+        // forge-lint: disable-next-line(unsafe-typecast)
         t.rangeStart = uint64(start);
+        // forge-lint: disable-next-line(unsafe-typecast)
         t.rangeEnd = uint64(end);
         t.rangeValid = t.headOperations != 0
             && !(t.headOperations > MMR_MAX_LEAVES
@@ -236,6 +242,7 @@ library BajillionChallenge {
         Target memory target = _target(operator, context, roots);
         uint8 tag = uint8(encoded[0]);
         if (tag == 3) return _ackFork(target, encoded);
+        if (tag == 1) return _higherAckDebit(target, encoded);
         return (ChallengeKindUnsupported.selector, false, 0);
     }
 
@@ -265,6 +272,158 @@ library BajillionChallenge {
                 && keccak256(leftMessage) != keccak256(rightMessage)
         ) return (bytes4(0), true, ACK_FORK);
         return (bytes4(0), false, 0);
+    }
+
+    /// @dev `Challenge::HigherAckDebit` (challenge.rs:636-672).
+    function _higherAckDebit(Target memory target, bytes calldata encoded)
+        private
+        view
+        returns (bytes4 err, bool proven, uint8 kind)
+    {
+        bytes calldata ack = encoded[1:1 + ACK_WITNESS_SIZE];
+        // `AckWitness::reconstruct` (challenge.rs:64-94): payer signature, then operator.
+        bytes memory message = _message(target, ack);
+        bytes32 payer = Codec.readBytes32(ack, 0);
+        if (!Ed25519Verifier.verify(payer, ack[112:176], _frame(VECTOR_SEND_NAMESPACE, message))) {
+            return (ChallengeInvalidPayerSignature.selector, false, 0);
+        }
+        if (!Ed25519Verifier.verify(target.operator, ack[176:240], _frame(VECTOR_ACK_NAMESPACE, message))) {
+            return (ChallengeInvalidOperatorSignature.selector, false, 0);
+        }
+        if (!target.rangeValid) return (ChallengeLookupOrder.selector, false, 0);
+
+        (bytes4 lookupErr, uint64 terminalDebit, bool present, uint64 terminalSeq, bytes32 sendRoot) =
+            _resolveAccount(target, encoded, 1 + ACK_WITNESS_SIZE, payer);
+        if (lookupErr != bytes4(0)) return (lookupErr, false, 0);
+
+        uint64 seq = Codec.readU64(ack, 32);
+        uint64 debit = Codec.readU64(ack, 40);
+        if (debit > terminalDebit) return (bytes4(0), true, HIGHER_ACK_DEBIT);
+        // `has_outgoing` is `terminal_debit != 0` (state.rs:177-182); `matches_outgoing` compares
+        // the row's terminal body with the acknowledged body (state.rs:190-204). The payer and the
+        // context are already equal, so the bodies match iff seq, debit and send root match.
+        if (present && terminalDebit != 0) {
+            bool matches = seq == terminalSeq && debit == terminalDebit && Codec.readBytes32(ack, 48) == sendRoot;
+            if (!matches) {
+                if (seq == terminalSeq) return (bytes4(0), true, HIGHER_ACK_DEBIT);
+                if (debit == terminalDebit && seq > terminalSeq) return (bytes4(0), true, HIGHER_ACK_DEBIT);
+            }
+        }
+        return (bytes4(0), false, 0);
+    }
+
+    /// @dev `AccountLookup::resolve` (challenge.rs:323-345) and `ChangeAbsence::resolve`
+    /// (challenge.rs:248-293).
+    function _resolveAccount(Target memory target, bytes calldata encoded, uint256 pos, bytes32 account)
+        private
+        view
+        returns (bytes4 err, uint64 terminalDebit, bool present, uint64 terminalSeq, bytes32 sendRoot)
+    {
+        uint8 tag = uint8(encoded[pos++]);
+        if (tag == 1) {
+            terminalDebit = Codec.readU64(encoded, pos);
+            terminalSeq = Codec.readU64(encoded, pos + 8);
+            sendRoot = Codec.readBytes32(encoded, pos + 16);
+            uint64 start = Codec.readU64(encoded, pos + 48);
+            if (!_contains(target, start, 1)) return (ChallengeLookupOrder.selector, 0, false, 0, 0);
+            bytes[] memory rows = new bytes[](1);
+            rows[0] = _rowOperation(account, encoded[pos:pos + 48]);
+            if (!_verifyActivity(target, encoded, pos + 48, rows)) {
+                return (ChallengeActivity.selector, 0, false, 0, 0);
+            }
+            return (bytes4(0), terminalDebit, true, terminalSeq, sendRoot);
+        }
+        return (_resolveAbsence(target, encoded, pos, account), 0, false, 0, 0);
+    }
+
+    function _resolveAbsence(Target memory target, bytes calldata encoded, uint256 pos, bytes32 account)
+        private
+        view
+        returns (bytes4)
+    {
+        if (!_contains(target, target.rangeStart, 0)) return ChallengeLookupOrder.selector;
+        bool hasPredecessor = encoded[pos] == 0x01;
+        bytes calldata predecessor = encoded[0:0];
+        if (hasPredecessor) predecessor = encoded[pos + 1:pos + 1 + ACCOUNT_CHANGE_SIZE];
+        pos += hasPredecessor ? 1 + ACCOUNT_CHANGE_SIZE : 1;
+        bool hasSuccessor = encoded[pos] == 0x01;
+        bytes calldata successor = encoded[0:0];
+        if (hasSuccessor) successor = encoded[pos + 1:pos + 1 + ACCOUNT_CHANGE_SIZE];
+        pos += hasSuccessor ? 1 + ACCOUNT_CHANGE_SIZE : 1;
+        bool hasOpening = encoded[pos] == 0x01;
+        pos += 1;
+
+        uint64 count = (hasPredecessor ? 1 : 0) + (hasSuccessor ? 1 : 0);
+        if (count == 0) {
+            return target.rangeStart == target.rangeEnd && !hasOpening ? bytes4(0) : ChallengeLookupOrder.selector;
+        }
+        if (!hasOpening) return ChallengeLookupOrder.selector;
+        uint64 start = Codec.readU64(encoded, pos);
+        if (
+            !_contains(target, start, count) || (!hasPredecessor && start != target.rangeStart)
+                || (!hasSuccessor && start + count != target.rangeEnd)
+                || (hasPredecessor && Codec.readBytes32(predecessor, 0) >= account)
+                || (hasSuccessor && Codec.readBytes32(successor, 0) <= account)
+        ) return ChallengeLookupOrder.selector;
+        bytes[] memory rows = new bytes[](count);
+        uint256 i;
+        if (hasPredecessor) rows[i++] = _rowOperation(Codec.readBytes32(predecessor, 0), predecessor[32:]);
+        if (hasSuccessor) rows[i] = _rowOperation(Codec.readBytes32(successor, 0), successor[32:]);
+        if (!_verifyActivity(target, encoded, pos, rows)) return ChallengeActivity.selector;
+        return bytes4(0);
+    }
+
+    /// @dev `ActivityRange::contains` (transition.rs:201-209).
+    function _contains(Target memory t, uint64 start, uint64 count) private pure returns (bool) {
+        return t.rangeStart > 0 && t.rangeStart <= t.rangeEnd && t.headOperations <= MMR_MAX_LEAVES
+            && t.rangeEnd < t.headOperations && t.headFloor < t.headOperations && start >= t.rangeStart
+            && uint256(start) + count <= t.rangeEnd;
+    }
+
+    /// @dev `Opening::verify_activity` -> `Opening::verify` (logs.rs:381-433) for consecutive rows.
+    function _verifyActivity(Target memory t, bytes calldata encoded, uint256 pos, bytes[] memory rows)
+        private
+        view
+        returns (bool)
+    {
+        uint64 start = Codec.readU64(encoded, pos);
+        (uint256 leaves, uint256 next,) = Codec.readVarint(encoded, pos + 8, 64);
+        uint256 inactive;
+        (inactive, next,) = Codec.readVarint(encoded, next, 64);
+        uint256 count;
+        (count, next,) = Codec.readVarint(encoded, next, 32);
+        if (
+            t.headOperations == 0 || t.headFloor >= t.headOperations || start >= MMR_MAX_LEAVES
+                || uint256(start) + rows.length > t.headOperations - 1 || leaves != t.headOperations
+                || inactive != _inactivePeaks(t.headOperations, t.headFloor)
+        ) return false;
+        bytes32[] calldata digests;
+        assembly ("memory-safe") {
+            digests.offset := add(encoded.offset, next)
+            digests.length := count
+        }
+        (bytes32 root, bool valid) = LibQMDBCommon.reconstructRange(
+            rows, leaves, start, digests, inactive, LibMerkle.RangeGraft(0, 0, 0, 0), LibMerkle.Family.MMR, address(2)
+        );
+        return valid && root == t.headRoot;
+    }
+
+    /// @dev `mmr::Family::inactive_peaks` (storage/src/merkle/mod.rs:101-116).
+    function _inactivePeaks(uint64 leaves, uint64 floor) private pure returns (uint256 count) {
+        uint256 sum;
+        for (uint256 i; i < 64; ++i) {
+            uint256 capacity = uint256(1) << (63 - i);
+            if (leaves & capacity == 0) continue;
+            sum += capacity;
+            if (sum > floor) break;
+            ++count;
+        }
+    }
+
+    /// @dev Keyless `Append(ActivityRecord::Row(row))`: `0x01 || 0x00 || account || value`
+    /// (storage/src/qmdb/keyless/operation/variable.rs:15-26, logs.rs:63-75).
+    function _rowOperation(bytes32 account, bytes calldata value) private pure returns (bytes memory) {
+        return abi.encodePacked(hex"0100", account, value[0:48]);
     }
 
     /// @dev `VectorSendBody::message` (payment.rs:194-201): `anchor || epoch || payer || seq ||
