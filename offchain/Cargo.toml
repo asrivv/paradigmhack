@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["fixtures"]
+members = ["fixtures", "oracle"]
 
 [workspace.package]
 edition = "2024"
@@ -22,9 +22,15 @@ commonware-cryptography-curve25519 = { git = "https://github.com/commonwarexyz/m
 commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
 commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340" }
 # Same versions the upstream workspace locks.
+alloy-sol-types = "1.7.2"
 blst = { version = "0.3.16", default-features = false }
 bytes = "1.12.1"
 ed25519-consensus = "2.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
+
+# The oracle replays closes, BLS certificates, and QMDB proofs per Foundry fuzz case; unoptimized
+# dependencies make each vm.ffi call and the randomized tests several times slower.
+[profile.dev.package."*"]
+opt-level = 3
