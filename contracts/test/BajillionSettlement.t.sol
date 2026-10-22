@@ -397,6 +397,17 @@ contract BajillionSettlementTest is SettlementBase {
         deployer.deploy(d);
     }
 
+    function test_RejectsNonStrictOperatorKey() public {
+        SettlementHarnessDeployer deployer = new SettlementHarnessDeployer();
+        BajillionSettlement.DeploymentArgs memory d = _args();
+        d.operator = keccak256("not a curve point with high probability");
+        vm.expectRevert(BajillionSettlement.InvalidOperatorKey.selector);
+        deployer.deploy(d);
+        d.operator = bytes32(uint256(1) << 248); // the identity
+        vm.expectRevert(BajillionSettlement.InvalidOperatorKey.selector);
+        deployer.deploy(d);
+    }
+
     function test_RejectsMalformedCommittee() public {
         SettlementHarnessDeployer deployer = new SettlementHarnessDeployer();
         BajillionSettlement.DeploymentArgs memory d = _args();

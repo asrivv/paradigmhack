@@ -9,6 +9,7 @@ import { LibQMDBCommon } from "commonware/qmdb/LibQMDBCommon.sol";
 import { LibBLS12381Point } from "./verify/LibBLS12381Point.sol";
 import { LibBLS12381PoP } from "./verify/LibBLS12381PoP.sol";
 import { LibClearingCodec as Codec } from "./verify/LibClearingCodec.sol";
+import { LibEd25519 } from "./verify/LibEd25519.sol";
 import { LibVectorCommitment as Vector } from "./verify/LibVectorCommitment.sol";
 
 /// @notice Minimal TIP-20 surface. TIP-20 tokens expose the ERC-20 transfer functions.
@@ -297,6 +298,7 @@ contract BajillionSettlement {
     error DuplicateValidator();
     // Embedding errors with no Rust counterpart.
     error ZeroConfig();
+    error InvalidOperatorKey();
     error NonCanonicalCommittee();
     error CommitteeEncoding();
     error InvalidProofOfPossession();
@@ -468,6 +470,9 @@ contract BajillionSettlement {
         ) revert ZeroConfig();
         if (d.expectedEpoch == type(uint64).max) revert EpochOverflow();
         if (c.maximumWithdrawalNotice < c.minimumWithdrawalNotice) revert WithdrawalNoticeOrder();
+        // The operator is a `StrictVerifyingKey` upstream, so decoding rejects any other key
+        // (cryptography/curve25519/src/signing.rs:403-415).
+        if (!LibEd25519.isStrictKey(d.operator)) revert InvalidOperatorKey();
 
         (bytes32 commitment, bytes32 keysHash, uint256 n) = _registerCommittee(d.committee, d.popNamespace);
 

@@ -18,7 +18,8 @@ abstract contract SettlementBase is Test {
     bytes internal constant POP_NAMESPACE = "_PARADIGMHACK_TEST_POP";
 
     bytes32 internal constant DEPLOYMENT = keccak256("deployment");
-    bytes32 internal constant OPERATOR = keccak256("operator");
+    /// @dev A strict Ed25519 key: the crate fixture's operator.
+    bytes32 internal constant OPERATOR = 0xf0a7d3368f79ddfccab74add41b08fa03481bdbd1b1ef98c7856c9d816f7a367;
     bytes32 internal constant GENESIS_ROOT = keccak256("genesis state root");
     uint64 internal constant ADMISSION_DELAY = 10;
     uint64 internal constant CHALLENGE_DURATION = 100;
