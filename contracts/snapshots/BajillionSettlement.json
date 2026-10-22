@@ -1,11 +1,11 @@
 {
-  "admit_fixture_n4_signers3_oneWithdrawal": "331323",
-  "admit_n4_q2": "306667",
-  "claimWithdrawal_fixture_3leaves": "80476",
-  "claimWithdrawal_mergeBoth_10leaves": "52383",
-  "claimWithdrawal_newRange_10leaves": "74582",
-  "deposit_firstForAccount": "174875",
-  "finalize": "71452",
-  "finalize_fixture": "114052",
-  "registerEpoch_oneDeposit": "203260"
+  "admit_fixture_n4_signers3_oneWithdrawal": "339880",
+  "admit_n4_q2": "315369",
+  "claimWithdrawal_fixture_3leaves": "85446",
+  "claimWithdrawal_mergeBoth_10leaves": "54871",
+  "claimWithdrawal_newRange_10leaves": "79570",
+  "deposit_firstForAccount": "174864",
+  "finalize": "71419",
+  "finalize_fixture": "114019",
+  "registerEpoch_oneDeposit": "206310"
 }

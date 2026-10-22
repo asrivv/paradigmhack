@@ -81,6 +81,7 @@ library Fixture {
         d.asset = asset;
         d.bond = bond;
         d.popNamespace = bytesAt(".bls.pop_namespace");
+        d.maxChallengeBytes = uint64(uintAt(".scenario.settlement_config.max_challenge_bytes"));
         d.committee = new BajillionSettlement.Validator[](4);
         for (uint256 i; i < 4; ++i) {
             d.committee[i] = BajillionSettlement.Validator(

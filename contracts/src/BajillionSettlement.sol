@@ -2,14 +2,11 @@
 pragma solidity ^0.8.36;
 
 import { LibBLS12381 as BLS } from "commonware/certificate/LibBLS12381.sol";
-import { LibBLS12381Multisig } from "commonware/certificate/LibBLS12381Multisig.sol";
 import { LibCodec } from "commonware/codec/LibCodec.sol";
-import { LibMerkle } from "commonware/merkle/LibMerkle.sol";
-import { LibQMDBCommon } from "commonware/qmdb/LibQMDBCommon.sol";
-import { LibBLS12381Point } from "./verify/LibBLS12381Point.sol";
-import { LibBLS12381PoP } from "./verify/LibBLS12381PoP.sol";
+import { AdmissionVerifier, CertificateVerifier, PayoutVerifier } from "./verify/BajillionVerifiers.sol";
 import { LibClearingCodec as Codec } from "./verify/LibClearingCodec.sol";
-import { LibEd25519 } from "./verify/LibEd25519.sol";
+import { Ed25519Verifier } from "./verify/LibEd25519.sol";
+import { BajillionChallenge } from "./BajillionChallenge.sol";
 import { LibVectorCommitment as Vector } from "./verify/LibVectorCommitment.sol";
 
 /// @notice Minimal TIP-20 surface. TIP-20 tokens expose the ERC-20 transfer functions.
@@ -25,11 +22,11 @@ interface ITIP20 {
 /// contract is an embedding of their state machine: names, preconditions and error order follow
 /// the Rust code, and every function cites the lines it ports.
 ///
-/// Scope of this pass: constructor, `deposit` (record_deposit), `registerEpoch`, `admit`,
-/// `finalize`, `claimWithdrawal`, `faultExpired`, and the liveness fence that every `now`-taking
-/// method observes first. Withdrawal batches must be empty: the crate signs withdrawals with
-/// Ed25519, which has no EVM precompile. Challenges, chain-queued withdrawals and terminal
-/// settlement come later.
+/// Implemented: constructor, `deposit` (record_deposit), `registerEpoch`, `admit`, `finalize`,
+/// `claimWithdrawal`, `faultExpired`, `challenge` (challenge_encoded, adjudicated in the linked
+/// `BajillionChallenge` library), and the liveness fence that every `now`-taking method observes
+/// first. Withdrawal batches must still be empty: verifying their Ed25519 signatures at intake is
+/// next. Chain-queued withdrawals, `HigherAckEntry` and terminal settlement come later.
 ///
 /// Clock: `now` is `block.timestamp`, which Tempo keeps non-decreasing. The crate requires one
 /// authenticated monotonic clock (settlement.rs:10) and does not fix its unit.
@@ -83,7 +80,18 @@ interface ITIP20 {
 /// | admission::Error::DuplicateValidator | `DuplicateValidator()` |
 /// | panic in register_epoch (deposits exceed unpulled, settlement.rs:1304-1307) | `DepositAggregate()` |
 /// | WithdrawalWitness, DuplicateWithdrawal, Withdrawal* | not reachable: `WithdrawalsUnsupported()` |
-/// | Challenge, AlreadyChallenged, hard-fault settlement variants | not in this pass |
+/// | SettlementError::AlreadyChallenged | `AlreadyChallenged()` |
+/// | ChallengeError::Expired | `ChallengeExpired()` |
+/// | ChallengeError::TooLarge | `ChallengeTooLarge()` |
+/// | ChallengeError::HeaderRoot | `ChallengeHeaderRoot()` |
+/// | ChallengeError::Codec | `ChallengeCodec()` |
+/// | ChallengeError::LookupOrder | `ChallengeLookupOrder()` |
+/// | ChallengeError::Activity | `ChallengeActivity()` |
+/// | ChallengeError::Ack(InvalidPayerSignature) | `ChallengeInvalidPayerSignature()` |
+/// | ChallengeError::Ack(InvalidOperatorSignature) | `ChallengeInvalidOperatorSignature()` |
+/// | HigherAckEntry evidence (Ack(InfeasibleEntry), Vector, Commitment) | `ChallengeKindUnsupported()` |
+/// | Any of the above after this call wrote the fence | `Status.Rejected` and `Rejected(selector)` |
+/// | Hard-fault settlement variants | not in this pass |
 ///
 /// Errors with no Rust counterpart are embedding checks: decoding (`*Encoding`), witnesses the
 /// contract needs because it is not the Rust process (`CommitteeKeys`, point hints), fixed
@@ -104,7 +112,17 @@ contract BajillionSettlement {
         ChallengeWindowOpen,
         StateAncestry,
         EpochOverflow,
-        CustodyArithmetic
+        CustodyArithmetic,
+        /// The call wrote the fence, then its operation failed; `Rejected` carries the error.
+        Rejected
+    }
+
+    /// @notice `challenge::Verdict` (challenge.rs:606-612) with the proven `ChallengeKind`.
+    enum Verdict {
+        NoContradiction,
+        ProvenHigherAckDebit,
+        ProvenHigherAckEntry,
+        ProvenAckFork
     }
 
     /// @notice `HardFaultReason` tags, offset by one from settlement.rs:2277-2311 so zero means
@@ -155,6 +173,9 @@ contract BajillionSettlement {
         uint256 bond;
         bytes popNamespace;
         Validator[] committee;
+        /// Outer byte bound passed to `challenge_encoded` (settlement.rs:1559-1572). The crate
+        /// leaves it to the embedding.
+        uint64 maxChallengeBytes;
     }
 
     /// @notice Arguments to `admit`, grouped to keep the stack shallow.
@@ -207,6 +228,7 @@ contract BajillionSettlement {
         // Admission (settlement.rs:1523-1540).
         uint64 withdrawalTotal;
         uint8 status;
+        uint8 challengeKind; // ChallengeKind tag (settlement.rs:2227-2233) when status is CHALLENGED.
         bytes32 batchId;
         bytes32 successorRoot;
         bytes32 activityRoot;
@@ -313,6 +335,17 @@ contract BajillionSettlement {
     error PipelineFull();
     error InboxFull();
     error TransferFailed();
+    // Challenge errors (settlement.rs:3285-3289, challenge.rs:731-759).
+    error AlreadyChallenged();
+    error ChallengeExpired();
+    error ChallengeTooLarge();
+    error ChallengeHeaderRoot();
+    error ChallengeCodec();
+    error ChallengeKindUnsupported();
+    error ChallengeLookupOrder();
+    error ChallengeActivity();
+    error ChallengeInvalidPayerSignature();
+    error ChallengeInvalidOperatorSignature();
 
     // ---------------------------------------------------------------------------------------
     // Events
@@ -333,6 +366,9 @@ contract BajillionSettlement {
     event WithdrawalClaimed(
         uint64 indexed index, address indexed destination, uint64 amount, uint64 rangeStart, uint64 rangeEnd
     );
+    event ChallengeProven(uint64 indexed epoch, bytes32 indexed batchId, Verdict verdict, uint64 invalidatedThrough);
+    /// @notice A call that wrote the fence then failed with `reason` (the custom error's selector).
+    event Rejected(bytes4 reason);
     /// @param detail The account for an expired deposit or withdrawal, the anchor for an expired
     /// registration, or the batch id for a proven challenge.
     event HardFault(FaultKind kind, uint64 expiredAt, bytes32 detail, uint64 epoch, uint64 admissionFenceEpoch);
@@ -344,7 +380,6 @@ contract BajillionSettlement {
     bytes internal constant HEADER_ROOT_NAMESPACE = "_COMMONWARE_CLEARING_HEADER_ROOT"; // transition.rs:38
     bytes internal constant BATCH_ID_NAMESPACE = "_COMMONWARE_CLEARING_BATCH_ID"; // transition.rs:36
     bytes internal constant EPOCH_ANCHOR_NAMESPACE = "_COMMONWARE_CLEARING_EPOCH_ANCHOR"; // transition.rs:40
-    bytes internal constant HEADER_NAMESPACE = "_COMMONWARE_CLEARING_HEADER"; // admission/certificate.rs:14
     bytes internal constant COMMITTEE_NAMESPACE = "_COMMONWARE_CLEARING_COMMITTEE"; // admission/certificate.rs:16
 
     /// @dev `mmr::Family::MAX_LEAVES` (storage/src/merkle/mmr/mod.rs:110).
@@ -397,6 +432,7 @@ contract BajillionSettlement {
     uint64 public immutable maximumWithdrawalNotice;
     uint64 public immutable maxDestinationBytes;
     uint64 public immutable maxDepositIds;
+    uint64 public immutable maxChallengeBytes;
 
     // ---------------------------------------------------------------------------------------
     // State
@@ -437,6 +473,8 @@ contract BajillionSettlement {
     uint64 public admissionFenceEpoch;
     uint64 public claimedCount;
     bytes32 public faultDetail;
+    /// @dev The earliest receipt-invalidated close (settlement.rs:684).
+    bytes32 public invalidFrom;
 
     mapping(uint256 => Epoch) internal epochs;
     /// @dev Unadmitted deposit totals by account (settlement.rs:666-668). One slot per account.
@@ -472,7 +510,7 @@ contract BajillionSettlement {
         if (c.maximumWithdrawalNotice < c.minimumWithdrawalNotice) revert WithdrawalNoticeOrder();
         // The operator is a `StrictVerifyingKey` upstream, so decoding rejects any other key
         // (cryptography/curve25519/src/signing.rs:403-415).
-        if (!LibEd25519.isStrictKey(d.operator)) revert InvalidOperatorKey();
+        if (!Ed25519Verifier.isStrictKey(d.operator)) revert InvalidOperatorKey();
 
         (bytes32 commitment, bytes32 keysHash, uint256 n) = _registerCommittee(d.committee, d.popNamespace);
 
@@ -493,6 +531,7 @@ contract BajillionSettlement {
         maximumWithdrawalNotice = c.maximumWithdrawalNotice;
         maxDestinationBytes = c.maxDestinationBytes;
         maxDepositIds = c.maxDepositIds;
+        maxChallengeBytes = d.maxChallengeBytes;
 
         bytes32 bootstrap = sha256(abi.encodePacked(uint64(1), sha256(abi.encodePacked(uint64(0), hex"000000"))));
         bootstrapLogRoot = bootstrap;
@@ -529,16 +568,15 @@ contract BajillionSettlement {
         BLS.G2Point[] memory points = new BLS.G2Point[](n);
         for (uint256 i; i < n; ++i) {
             Validator memory v = committee[i];
-            if (v.key.length != 96 || !LibBLS12381Point.matchesG2(v.key, v.point)) revert CommitteeEncoding();
+            (bool keyOk, bool popOk) =
+                CertificateVerifier.verifyValidator(v.key, v.point, v.pop, v.popPoint, popNamespace);
+            if (!keyOk) revert CommitteeEncoding();
             if (i > 0) {
                 int256 order = _compare96(committee[i - 1].key, v.key);
                 if (order == 0) revert DuplicateValidator();
                 if (order > 0) revert NonCanonicalCommittee();
             }
-            if (
-                !LibBLS12381Point.matchesG1(v.pop, v.popPoint)
-                    || !LibBLS12381PoP.verify(v.popPoint, v.point, popNamespace, v.key)
-            ) revert InvalidProofOfPossession();
+            if (!popOk) revert InvalidProofOfPossession();
             points[i] = v.point;
             encoded = bytes.concat(encoded, v.key);
         }
@@ -708,7 +746,7 @@ contract BajillionSettlement {
         (bytes32 batchWithdrawalRoot,) = _withdrawalBoundary(withdrawals);
         bytes32 depositRoot = Codec.readBytes32(context, 104);
         bytes32 withdrawalRoot = Codec.readBytes32(context, 136);
-        if (depositRoot != Vector.depositRoot(records, count) || withdrawalRoot != batchWithdrawalRoot) {
+        if (depositRoot != AdmissionVerifier.depositRoot(records, count) || withdrawalRoot != batchWithdrawalRoot) {
             revert BoundaryRoot();
         }
         bytes calldata limits = context[168:232];
@@ -766,7 +804,7 @@ contract BajillionSettlement {
 
     /// @dev `frontier_deadlines` (settlement.rs:883-893). The challenge deadline stays below
     /// u64::MAX so one later tick exists for finalization or expiry.
-    function _frontierDeadlines(uint64 now_) private view returns (uint64 admission, uint64 challenge) {
+    function _frontierDeadlines(uint64 now_) private view returns (uint64 admissionAt, uint64 challengeAt) {
         uint256 a = uint256(now_) + admissionDelay;
         uint256 c = a + challengeDuration;
         if (a > type(uint64).max || c >= type(uint64).max) revert EpochDeadlineOverflow();
@@ -869,20 +907,9 @@ contract BajillionSettlement {
     /// popcount `>= q`. The uncompressed hint must compress to the certificate's signature.
     function _verifyCertificate(Admission calldata a) private view {
         if (keccak256(abi.encode(a.committee)) != committeeKeysHash) revert CommitteeKeys();
-        uint256 n = committeeSize;
-        uint256 bitmapLength = (n + 7) >> 3;
-        bytes calldata certificate = a.certificate;
-        if (certificate.length != 8 + bitmapLength + 48) revert InvalidCertificate();
-        if (Codec.readU64(certificate, 0) != n) revert InvalidCertificate();
-        if (!LibBLS12381Point.matchesG1(certificate[8 + bitmapLength:], a.signature)) revert InvalidCertificate();
-        if (!LibBLS12381Multisig.verifyMinSig(
-                a.signature,
-                certificate[8:8 + bitmapLength],
-                a.committee,
-                quorum,
-                HEADER_NAMESPACE,
-                abi.encodePacked(a.header)
-            )) revert InvalidCertificate();
+        if (!CertificateVerifier.verifyCertificate(a.header, a.certificate, a.signature, a.committee, quorum)) {
+            revert InvalidCertificate();
+        }
     }
 
     /// @dev `validate_close_amounts` (transition.rs:1771-1805), including `validate_boundary_roots`
@@ -900,47 +927,43 @@ contract BajillionSettlement {
         }
         (bytes calldata records, uint256 count, uint64 depositTotal) = _decodeDeposits(a.deposits);
         (bytes32 withdrawalRoot, uint256 withdrawalCount) = _withdrawalBoundary(a.withdrawals);
-        if (Vector.depositRoot(records, count) != rec.depositRoot || withdrawalRoot != rec.withdrawalRoot) {
+        if (AdmissionVerifier.depositRoot(records, count) != rec.depositRoot || withdrawalRoot != rec.withdrawalRoot) {
             revert TransitionBoundaryRoot();
         }
-        // limits: max_states, max_rows, max_withdrawals, max_account_entries, max_total_entries,
-        // max_payment_total, max_deposit_total, max_withdrawal_total.
-        if (a.withdrawalTotal > rec.limits[7]) revert TransitionCloseLimit();
+        (bytes4 err, uint64 successorLiability) = AdmissionVerifier.closeBounds(
+            AdmissionVerifier.CloseBounds({
+                withdrawalTotal: a.withdrawalTotal,
+                maxRows: rec.limits[1],
+                maxTotalEntries: rec.limits[4],
+                maxWithdrawalTotal: rec.limits[7],
+                floorActivity: rec.floorActivity,
+                floorPayouts: rec.floorPayouts,
+                headActivityOperations: hd.activity.operations,
+                headActivityFloor: hd.activity.floor,
+                headPayoutsOperations: hd.payouts.operations,
+                headPayoutsFloor: hd.payouts.floor,
+                headLiability: hd.liability,
+                depositTotal: depositTotal,
+                withdrawalCount: withdrawalCount,
+                changeOperations: roots.change.operations,
+                changeFloor: roots.change.floor,
+                rowCount: roots.rowCount,
+                outputOperations: roots.outputs.operations,
+                outputFloor: roots.outputs.floor,
+                successorOperations: roots.successorOperations,
+                successorSyncBoundary: roots.successorSyncBoundary
+            })
+        );
+        if (err != bytes4(0)) _revertWith(err);
+        return successorLiability;
+    }
 
-        // activity_range
-        {
-            uint256 start = hd.activity.operations;
-            uint256 end = start + roots.rowCount;
-            if (roots.change.operations == 0) revert TransitionLogRange();
-            uint256 commit = roots.change.operations - 1;
-            if (
-                roots.change.operations > MMR_MAX_LEAVES || start == 0 || end > commit || roots.rowCount > rec.limits[1]
-                    || roots.rowCount > MAX_VECTOR_LENGTH || commit - end > rec.limits[4]
-                    || (roots.rowCount == 0 && end != commit) || roots.change.floor != rec.floorActivity
-                    || roots.change.floor < hd.activity.floor || roots.change.floor >= start
-            ) revert TransitionLogRange();
+    /// @dev Revert with a bare custom-error selector returned by a linked library.
+    function _revertWith(bytes4 err) private pure {
+        assembly ("memory-safe") {
+            mstore(0, err)
+            revert(0, 4)
         }
-
-        // Payout log: exactly one output per registered withdrawal plus the trailing commit.
-        {
-            uint256 start = hd.payouts.operations;
-            if (
-                start + withdrawalCount + 1 != roots.outputs.operations || roots.outputs.operations > MMR_MAX_LEAVES
-                    || roots.outputs.floor != rec.floorPayouts || roots.outputs.floor < hd.payouts.floor
-                    || roots.outputs.floor >= start || roots.successorOperations == 0
-                    || roots.successorOperations > MMB_MAX_LEAVES
-                    || roots.successorSyncBoundary >= roots.successorOperations
-                    || (withdrawalCount == 0 && a.withdrawalTotal != 0)
-            ) revert TransitionWithdrawalOutputRoot();
-        }
-
-        // `checked_successor_liability` (transition.rs:1842-1851).
-        uint256 credited = uint256(hd.liability) + depositTotal;
-        if (credited < a.withdrawalTotal) revert TransitionLiabilityEquation();
-        uint256 successor = credited - a.withdrawalTotal;
-        if (successor > type(uint64).max) revert TransitionLiabilityOverflow();
-        // forge-lint: disable-next-line(unsafe-typecast) bounded by the checks above
-        return uint64(successor);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -994,6 +1017,72 @@ contract BajillionSettlement {
         return Status.Ok;
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Challenges
+    // ---------------------------------------------------------------------------------------
+
+    /// @notice Adjudicate one encoded challenge against an admitted close through its inclusive
+    /// challenge deadline (`challenge_encoded`, settlement.rs:1559-1614).
+    /// @param batchId The target's `BatchId`.
+    /// @param context The target's 448-byte `CloseContext`, as published at admission.
+    /// @param roots The target's 184-byte `RootBundle`.
+    /// @param withdrawalTotal The target's certified withdrawal total.
+    /// @param encoded The crate's `Challenge` encoding.
+    /// @dev The contract stores only the batch id, so the caller supplies the context and roots;
+    /// recomputing the header from them and matching the batch id is the check upstream performs
+    /// in `adjudicate` (challenge.rs:631-633). A proven challenge marks the target challenged and
+    /// every later pending close invalidated, then fences the deployment into a hard fault. Earlier
+    /// pending closes can still finalize. Upstream has no bond, so nothing is slashed here.
+    /// Malformed evidence changes no state beyond the liveness fence this call observes first.
+    function challenge(
+        bytes32 batchId,
+        bytes calldata context,
+        bytes calldata roots,
+        uint64 withdrawalTotal,
+        bytes calldata encoded
+    ) external returns (Status, Verdict) {
+        uint64 now_ = _now();
+        bool fenced = _observeTime(now_);
+        if (encoded.length > maxChallengeBytes) return _rejectChallenge(fenced, ChallengeTooLarge.selector);
+        bytes4 err = BajillionChallenge.decode(encoded);
+        if (err != bytes4(0)) return _rejectChallenge(fenced, err);
+
+        // Find the admitted close (settlement.rs:1583-1596).
+        uint64 epoch = expectedEpoch;
+        while (epoch < admittedEnd && epochs[epoch % EPOCH_RING].batchId != batchId) {
+            ++epoch;
+        }
+        if (epoch == admittedEnd) return _rejectChallenge(fenced, NoPendingBatch.selector);
+        Epoch storage rec = epochs[epoch % EPOCH_RING];
+        if (rec.status == CHALLENGED) return _rejectChallenge(fenced, AlreadyChallenged.selector);
+        if (rec.status == INVALIDATED) return _rejectChallenge(fenced, BatchInvalidated.selector);
+        if (now_ > rec.challengeDeadline) return _rejectChallenge(fenced, ChallengeExpired.selector);
+
+        bool proven;
+        uint8 kind;
+        (err, proven, kind) = BajillionChallenge.adjudicate(batchId, operator, context, roots, withdrawalTotal, encoded);
+        if (err != bytes4(0)) return _rejectChallenge(fenced, err);
+        if (!proven) return (Status.Ok, Verdict.NoContradiction);
+
+        rec.status = CHALLENGED;
+        rec.challengeKind = kind;
+        for (uint64 e = epoch + 1; e < admittedEnd; ++e) {
+            epochs[e % EPOCH_RING].status = INVALIDATED;
+        }
+        invalidFrom = batchId;
+        Verdict verdict = Verdict(kind + 1);
+        emit ChallengeProven(epoch, batchId, verdict, admittedEnd - 1);
+        _enterHardFault(FaultKind.ProvenChallenge, 0, batchId, epoch);
+        return (Status.Ok, verdict);
+    }
+
+    /// @dev Return a `Rejected` status if this call wrote the fence; otherwise revert with `err`.
+    function _rejectChallenge(bool fenced, bytes4 err) private returns (Status, Verdict) {
+        if (!fenced) _revertWith(err);
+        emit Rejected(err);
+        return (Status.Rejected, Verdict.NoContradiction);
+    }
+
     /// @dev Return `status` if this call wrote the fence; otherwise revert with its error.
     function _reject(bool fenced, Status status) private pure returns (Status) {
         if (fenced) return status;
@@ -1038,28 +1127,11 @@ contract BajillionSettlement {
         // logs.rs:399-433). LibQMDBKeylessMMR.verify wraps LibQMDBCommon.verify with the MMR
         // family; its `Proof calldata` struct cannot point into the crate encoding, so the
         // contract calls the wrapped function directly.
-        {
-            bytes32[] calldata digests;
-            uint256 digestCount = (claim.length - digestsAt) >> 5;
-            assembly ("memory-safe") {
-                digests.offset := add(claim.offset, digestsAt)
-                digests.length := digestCount
-            }
-            if (
-                uint256(index) + 1 > uint256(hd.operations) - 1 || leaves != hd.operations
-                    || inactivePeaks != _inactivePeaks(hd.operations, hd.floor)
-                    || !LibQMDBCommon.verify(
-                        hd.root,
-                        bytes.concat(hex"01", claim[0:outputEnd]),
-                        leaves,
-                        index,
-                        digests,
-                        inactivePeaks,
-                        LibMerkle.Family.MMR,
-                        address(2)
-                    )
-            ) revert ClaimProof();
-        }
+        if (
+            uint256(index) + 1 > uint256(hd.operations) - 1 || leaves != hd.operations
+                || inactivePeaks != _inactivePeaks(hd.operations, hd.floor)
+                || !PayoutVerifier.verifyPayout(hd.root, claim, outputEnd, index, leaves, inactivePeaks, digestsAt)
+        ) revert ClaimProof();
         if (claimableBalance < amount) revert ClaimReserve();
         address destination = _destination(claim);
 
@@ -1220,9 +1292,7 @@ contract BajillionSettlement {
         return h.operations != 0 && h.operations <= MMR_MAX_LEAVES && h.floor < h.operations;
     }
 
-    /// @dev `WithdrawalClaim` decoding (transition.rs:1037-1047): `WithdrawalOutput`
-    /// (`varint(len) || destination || u64 amount`), then `Opening` (`u64 start || varint leaves ||
-    /// varint inactive_peaks || varint(count) || count * 32`), nothing trailing.
+    /// @dev `WithdrawalClaim` decoding, in `PayoutVerifier.decodeClaim`.
     function _decodeClaim(bytes calldata claim)
         private
         view
@@ -1235,23 +1305,10 @@ contract BajillionSettlement {
             uint256 digestsAt
         )
     {
-        (uint256 destinationLength, uint256 pos, bool ok) = Codec.readVarint(claim, 0, 32);
-        if (!ok || destinationLength > maxDestinationBytes) revert ClaimEncoding();
-        outputEnd = pos + destinationLength + 8;
-        if (claim.length < outputEnd + 8) revert ClaimEncoding();
-        amount = Codec.readU64(claim, outputEnd - 8);
-        index = Codec.readU64(claim, outputEnd);
-        // `Opening::read_cfg` rejects a start that is not a valid MMR index (logs.rs:445-448).
-        if (index >= MMR_MAX_LEAVES) revert ClaimEncoding();
-        pos = outputEnd + 8;
-        (leaves, pos, ok) = Codec.readVarint(claim, pos, 64);
+        bool ok;
+        (ok, outputEnd, amount, index, leaves, inactivePeaks, digestsAt) =
+            PayoutVerifier.decodeClaim(claim, maxDestinationBytes);
         if (!ok) revert ClaimEncoding();
-        (inactivePeaks, pos, ok) = Codec.readVarint(claim, pos, 64);
-        if (!ok) revert ClaimEncoding();
-        uint256 count;
-        (count, pos, ok) = Codec.readVarint(claim, pos, 32);
-        if (!ok || count > MAX_OPENING_DIGESTS || claim.length - pos != count * 32) revert ClaimEncoding();
-        digestsAt = pos;
     }
 
     /// @dev The asset adapter's destination: exactly one 20-byte Tempo address.

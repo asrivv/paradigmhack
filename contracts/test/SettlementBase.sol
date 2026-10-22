@@ -8,6 +8,7 @@ import { LibVectorCommitment as Vector } from "../src/verify/LibVectorCommitment
 import { SettlementHarness } from "./harness/SettlementHarness.sol";
 import { ScenarioBLS } from "./utils/ScenarioBLS.sol";
 import { MockTIP20 } from "./mocks/MockTIP20.sol";
+import { ScenarioEd25519 } from "./utils/ScenarioEd25519.sol";
 
 /// @dev Shared deployment and close construction. Scenario data comes from test/utils/ generators; crate conformance is in Conformance.t.sol.
 abstract contract SettlementBase is Test {
@@ -18,8 +19,9 @@ abstract contract SettlementBase is Test {
     bytes internal constant POP_NAMESPACE = "_PARADIGMHACK_TEST_POP";
 
     bytes32 internal constant DEPLOYMENT = keccak256("deployment");
-    /// @dev A strict Ed25519 key: the crate fixture's operator.
-    bytes32 internal constant OPERATOR = 0xf0a7d3368f79ddfccab74add41b08fa03481bdbd1b1ef98c7856c9d816f7a367;
+    /// @dev Scenario operator with a known secret, so tests can countersign acknowledgments.
+    ScenarioEd25519.Key internal operatorKey;
+    bytes32 internal OPERATOR;
     bytes32 internal constant GENESIS_ROOT = keccak256("genesis state root");
     uint64 internal constant ADMISSION_DELAY = 10;
     uint64 internal constant CHALLENGE_DURATION = 100;
@@ -39,6 +41,8 @@ abstract contract SettlementBase is Test {
 
     function setUp() public virtual {
         vm.warp(START);
+        operatorKey = ScenarioEd25519.fromSeed(keccak256("scenario operator"));
+        OPERATOR = operatorKey.publicKey;
         token = new MockTIP20();
         _buildCommittee();
         settlement = _deploy(_args());
@@ -78,6 +82,7 @@ abstract contract SettlementBase is Test {
         d.asset = address(token);
         d.bond = BOND;
         d.popNamespace = POP_NAMESPACE;
+        d.maxChallengeBytes = 65_536;
         d.committee = new BajillionSettlement.Validator[](N);
         for (uint256 i; i < N; ++i) {
             BLS.G1Point memory pop = ScenarioBLS.proveKey(secretKeys[i], POP_NAMESPACE, compressedKeys[i]);

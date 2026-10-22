@@ -108,7 +108,7 @@ library LibEd25519 {
     // Group law (RFC 8032 section 5.1.4, a = -1)
     // -------------------------------------------------------------------------------------------
 
-    function _add(Point memory p1, Point memory p2) private pure returns (Point memory) {
+    function _add(Point memory p1, Point memory p2) internal pure returns (Point memory) {
         uint256 a = mulmod(addmod(p1.y, P - p1.x, P), addmod(p2.y, P - p2.x, P), P);
         uint256 b = mulmod(addmod(p1.y, p1.x, P), addmod(p2.y, p2.x, P), P);
         uint256 c = mulmod(mulmod(p1.t, D2, P), p2.t, P);
@@ -120,7 +120,7 @@ library LibEd25519 {
         return Point(mulmod(e, f, P), mulmod(g, h, P), mulmod(f, g, P), mulmod(e, h, P));
     }
 
-    function _double(Point memory p1) private pure returns (Point memory) {
+    function _double(Point memory p1) internal pure returns (Point memory) {
         uint256 a = mulmod(p1.x, p1.x, P);
         uint256 b = mulmod(p1.y, p1.y, P);
         uint256 c = mulmod(2, mulmod(p1.z, p1.z, P), P);
@@ -132,16 +132,21 @@ library LibEd25519 {
         return Point(mulmod(e, f, P), mulmod(g, h, P), mulmod(f, g, P), mulmod(e, h, P));
     }
 
-    function _negate(Point memory p1) private pure returns (Point memory) {
+    function _negate(Point memory p1) internal pure returns (Point memory) {
         return Point((P - p1.x) % P, p1.y, p1.z, (P - p1.t) % P);
     }
 
-    function _identity() private pure returns (Point memory) {
+    function _identity() internal pure returns (Point memory) {
         return Point(0, 1, 1, 0);
     }
 
-    function _isIdentity(Point memory p1) private pure returns (bool) {
+    function _isIdentity(Point memory p1) internal pure returns (bool) {
         return p1.x % P == 0 && p1.y % P == p1.z % P;
+    }
+
+    /// @dev The Ed25519 base point in extended coordinates.
+    function basePoint() internal pure returns (Point memory) {
+        return Point(BX, BY, 1, mulmod(BX, BY, P));
     }
 
     /// @dev `s·B + k·Q` by joint double-and-add (Shamir's trick) over 253 bits; `s, k < L < 2^253`.
@@ -159,7 +164,7 @@ library LibEd25519 {
     }
 
     /// @dev `n·Q` by double-and-add over 253 bits; `n <= L < 2^253`.
-    function _scalarMul(uint256 n, Point memory q) private pure returns (Point memory acc) {
+    function _scalarMul(uint256 n, Point memory q) internal pure returns (Point memory acc) {
         acc = _identity();
         for (uint256 i = 253; i > 0; --i) {
             acc = _double(acc);
@@ -172,14 +177,14 @@ library LibEd25519 {
     // -------------------------------------------------------------------------------------------
 
     /// @dev `Scalar::from_bytes_mod_order_wide` of the 64-byte SHA-512 digest, read little-endian.
-    function _hashToScalar(bytes memory input) private pure returns (uint256) {
+    function _hashToScalar(bytes memory input) internal pure returns (uint256) {
         (bytes32 first, bytes32 second) = Sha2Ext.sha512(input);
         // Read little-endian, the digest's first 32 bytes are the low limb.
         return addmod(mulmod(_le(second) % L, R256, L), _le(first) % L, L);
     }
 
     /// @dev Interpret 32 bytes as a little-endian integer.
-    function _le(bytes32 b) private pure returns (uint256 v) {
+    function _le(bytes32 b) internal pure returns (uint256 v) {
         v = uint256(b);
         v = ((v & 0xff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00) >> 8)
             | ((v & 0x00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff) << 8);
@@ -193,7 +198,7 @@ library LibEd25519 {
     }
 
     /// @dev `base^exponent mod p` through the modexp precompile.
-    function _pow(uint256 base, uint256 exponent) private view returns (uint256 result) {
+    function _pow(uint256 base, uint256 exponent) internal view returns (uint256 result) {
         assembly ("memory-safe") {
             let ptr := mload(0x40)
             mstore(ptr, 0x20)
@@ -205,5 +210,18 @@ library LibEd25519 {
             if iszero(staticcall(gas(), 0x05, ptr, 0xc0, ptr, 0x20)) { revert(0, 0) }
             result := mload(ptr)
         }
+    }
+}
+
+/// @notice Linked-library entry points for `LibEd25519`. Callers reach Ed25519 through these
+/// public functions so its code (including the vendored SHA-512, whose assembly is not annotated
+/// memory-safe) compiles in its own unit and stays out of the caller's bytecode.
+library Ed25519Verifier {
+    function verify(bytes32 publicKey, bytes memory signature, bytes memory message) public view returns (bool) {
+        return LibEd25519.verify(publicKey, signature, message);
+    }
+
+    function isStrictKey(bytes32 publicKey) public view returns (bool) {
+        return LibEd25519.isStrictKey(publicKey);
     }
 }
