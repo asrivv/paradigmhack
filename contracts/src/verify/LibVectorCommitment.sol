@@ -15,6 +15,7 @@ pragma solidity ^0.8.36;
 library LibVectorCommitment {
     bytes internal constant DEPOSIT_LEAF_DOMAIN = "_COMMONWARE_CLEARING_DEPOSIT_LEAF";
     bytes internal constant DEPOSIT_ROOT_DOMAIN = "_COMMONWARE_CLEARING_DEPOSIT_ROOT";
+    bytes internal constant WITHDRAWAL_LEAF_DOMAIN = "_COMMONWARE_CLEARING_WITHDRAWAL_LEAF";
     bytes internal constant WITHDRAWAL_ROOT_DOMAIN = "_COMMONWARE_CLEARING_WITHDRAWAL_ROOT";
 
     /// @dev Encoded `DepositRecord` width: 32-byte account and u64 amount (boundary.rs:59-68).
@@ -37,6 +38,27 @@ library LibVectorCommitment {
             }
         }
         return _bind(DEPOSIT_ROOT_DOMAIN, count, _treeRoot(level));
+    }
+
+    /// @notice Root of a withdrawal vector whose encoded `SignedWithdrawal` records are packed in
+    /// `records`, record `i` ending at `ends[i]`. The caller bounds the count and checks that the
+    /// offsets are increasing and end at `records.length`.
+    function withdrawalRoot(bytes calldata records, uint256[] memory ends) internal pure returns (bytes32) {
+        uint256 count = ends.length;
+        if (count == 0) return emptyWithdrawalRoot();
+        bytes32[] memory level = new bytes32[](count);
+        // forge-lint: disable-next-line(unsafe-typecast) callers bound count by MAX_VECTOR_LENGTH (2^24)
+        uint32 n = uint32(count);
+        uint256 start;
+        for (uint32 i; i < n; ++i) {
+            bytes calldata encoded = records[start:ends[i]];
+            // forge-lint: disable-next-line(unsafe-typecast) a record fits in calldata, far below 2^64
+            uint64 length = uint64(encoded.length);
+            bytes32 element = sha256(abi.encodePacked(WITHDRAWAL_LEAF_DOMAIN, n, i, length, encoded));
+            level[i] = sha256(abi.encodePacked(i, element));
+            start = ends[i];
+        }
+        return _bind(WITHDRAWAL_ROOT_DOMAIN, count, _treeRoot(level));
     }
 
     /// @notice Root of the empty withdrawal vector.

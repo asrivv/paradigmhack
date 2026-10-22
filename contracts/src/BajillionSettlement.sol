@@ -700,10 +700,10 @@ contract BajillionSettlement {
         if (end < pulled || end > intake) revert IntakeRange();
 
         (bytes calldata records, uint256 count, uint64 depositTotal) = _decodeDeposits(deposits);
-        _requireEmptyWithdrawals(withdrawals);
+        (bytes32 batchWithdrawalRoot,) = _withdrawalBoundary(withdrawals);
         bytes32 depositRoot = Codec.readBytes32(context, 104);
         bytes32 withdrawalRoot = Codec.readBytes32(context, 136);
-        if (depositRoot != Vector.depositRoot(records, count) || withdrawalRoot != Vector.emptyWithdrawalRoot()) {
+        if (depositRoot != Vector.depositRoot(records, count) || withdrawalRoot != batchWithdrawalRoot) {
             revert BoundaryRoot();
         }
         bytes calldata limits = context[168:232];
@@ -894,9 +894,8 @@ contract BajillionSettlement {
             revert TransitionEpochAnchor();
         }
         (bytes calldata records, uint256 count, uint64 depositTotal) = _decodeDeposits(a.deposits);
-        _requireEmptyWithdrawals(a.withdrawals);
-        if (Vector.depositRoot(records, count) != rec.depositRoot || Vector.emptyWithdrawalRoot() != rec.withdrawalRoot)
-        {
+        (bytes32 withdrawalRoot, uint256 withdrawalCount) = _withdrawalBoundary(a.withdrawals);
+        if (Vector.depositRoot(records, count) != rec.depositRoot || withdrawalRoot != rec.withdrawalRoot) {
             revert TransitionBoundaryRoot();
         }
         // limits: max_states, max_rows, max_withdrawals, max_account_entries, max_total_entries,
@@ -920,7 +919,6 @@ contract BajillionSettlement {
         // Payout log: exactly one output per registered withdrawal plus the trailing commit.
         {
             uint256 start = hd.payouts.operations;
-            uint256 withdrawalCount = 0;
             if (
                 start + withdrawalCount + 1 != roots.outputs.operations || roots.outputs.operations > MMR_MAX_LEAVES
                     || roots.outputs.floor != rec.floorPayouts || roots.outputs.floor < hd.payouts.floor
@@ -1190,9 +1188,14 @@ contract BajillionSettlement {
         return (false, 0);
     }
 
-    /// @dev Withdrawals must be the empty batch: one varint zero byte.
-    function _requireEmptyWithdrawals(bytes calldata encoded) private pure {
+    /// @dev The withdrawal boundary's vector root and request count. Every signed withdrawal
+    /// carries an Ed25519 signature that settlement must verify (boundary.rs:454-472), and the EVM
+    /// has no Ed25519 precompile, so this pass accepts only the empty batch: one varint zero byte.
+    /// Ed25519 withdrawal verification is the next step; the test harness overrides this hook to
+    /// run crate fixtures that carry a withdrawal through the remaining production checks.
+    function _withdrawalBoundary(bytes calldata encoded) internal view virtual returns (bytes32 root, uint256 count) {
         if (encoded.length != 1 || encoded[0] != 0x00) revert WithdrawalsUnsupported();
+        return (Vector.emptyWithdrawalRoot(), 0);
     }
 
     /// @dev `RootBundle` decoding (transition.rs:285-298) with `LogHead::try_new` checks
