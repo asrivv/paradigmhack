@@ -10,33 +10,35 @@
 //! Usage: `cargo run -p bajillion-fixtures [output-dir]`.
 
 use bajillion_fixtures::{
+    deployment::{
+        ACCOUNTS, ADMISSION_DELAY, CHALLENGE_DURATION, DEPOSIT_INCLUSION_TIMEOUT, Deployment,
+        EPOCH, FIXTURE_SEED, MAX_CHALLENGE_BYTES, MAX_DEPOSIT_IDS, MAX_DESTINATION_BYTES,
+        MAXIMUM_WITHDRAWAL_NOTICE, MINIMUM_WITHDRAWAL_NOTICE, VALIDATOR_KEY_DST, VALIDATORS,
+        acknowledge, settlement_config,
+    },
     eip2537, hex,
-    storage::genesis_replica,
     trace::{Hashed, TracingSha256, record},
 };
 use bytes::Bytes;
 use commonware_clearing::bajillion::{
-    admission::{COMMITTEE_HASH_NAMESPACE, Committee, HEADER_NAMESPACE, Vote, bls12381, seal},
+    admission::{COMMITTEE_HASH_NAMESPACE, HEADER_NAMESPACE, Vote, bls12381, seal},
     boundary::{
         DepositBatch, SignedWithdrawal, WITHDRAWAL_ID_HASH_NAMESPACE,
         WITHDRAWAL_SIGNATURE_NAMESPACE, WithdrawalAction, WithdrawalBatch,
     },
     challenge::{AccountLookup, AckWitness, Challenge, ChallengeKind, Verdict, adjudicate},
-    commitment::{self, VectorKind, VectorRoot},
+    commitment::VectorRoot,
     custody::Epoch,
     payment::{
         SendAuthorization, VECTOR_ACK_SIGNATURE_NAMESPACE, VECTOR_SEND_SIGNATURE_NAMESPACE,
         VectorAck, VectorSendBody,
     },
     qmdb::account_key,
-    settlement::{
-        Bounds, ClaimedRange, EpochDeadlinePolicy, Genesis, SettlementChain, SettlementConfig,
-    },
+    settlement::{Bounds, ClaimedRange, SettlementChain},
     transition::{
-        BATCH_ID_HASH_NAMESPACE, CloseContext, CloseLimits, EPOCH_ANCHOR_HASH_NAMESPACE,
-        EpochContext, HEADER_ROOT_HASH_NAMESPACE, Header, ProposalId,
-        TERMINAL_BATCH_HASH_NAMESPACE, TERMINAL_BATCH_SIGNATURE_NAMESPACE, Terminal,
-        WithdrawalClaim, prepare_dealing,
+        BATCH_ID_HASH_NAMESPACE, CloseLimits, EPOCH_ANCHOR_HASH_NAMESPACE, EpochContext,
+        HEADER_ROOT_HASH_NAMESPACE, Header, ProposalId, TERMINAL_BATCH_HASH_NAMESPACE,
+        TERMINAL_BATCH_SIGNATURE_NAMESPACE, Terminal, WithdrawalClaim, prepare_dealing,
     },
     vector::{OutEntry, OutVector},
 };
@@ -44,7 +46,7 @@ use commonware_codec::{Decode as _, DecodeExt as _, Encode, FixedSize as _};
 use commonware_cryptography::{
     Hasher, Sha256, Signer as _,
     bls12381::primitives::{
-        group::{G1, G2, Private, Scalar},
+        group::{G1, G2},
         ops::{
             aggregate, compute_public, hash_with_namespace, sign_proof_of_possession,
             verify_proof_of_possession,
@@ -54,7 +56,7 @@ use commonware_cryptography::{
     sha256::Digest,
 };
 use commonware_cryptography_curve25519::signing::{
-    BatchVerifier, Signature, SigningKey, StrictVerifyingKey as Key,
+    BatchVerifier, Signature, StrictVerifyingKey as Key,
 };
 use commonware_parallel::Sequential;
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -62,22 +64,14 @@ use commonware_utils::{TestRng, iter::NonEmpty, union_unique};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroU64,
     path::{Path, PathBuf},
 };
-
-/// The single seed every key in the fixture derives from.
-const FIXTURE_SEED: u64 = 4664;
 
 const UPSTREAM_REPOSITORY: &str = "https://github.com/commonwarexyz/monorepo";
 const UPSTREAM_REV: &str = "dd6d60cb44fb3dc05cee1efa06d957ce30df1340";
 const UPSTREAM_REF: &str = "refs/pull/4664/head";
 
-/// First epoch the deployment registers.
-const EPOCH: u64 = 1;
-
-/// Opening balances and the canonical names used in the manifest.
-const ACCOUNTS: [(&str, u64); 4] = [("a", 100), ("b", 40), ("c", 25), ("d", 35)];
 /// Payments in acceptance order. Each payment is its own acknowledged batch, so a payer with two
 /// payments ends the epoch at sequence 1.
 const PAYMENTS: [(&str, &str, u64); 6] = [
@@ -104,33 +98,20 @@ const WITHDRAWAL_DESTINATION: [u8; 20] = [
 /// Settlement timing in abstract chain ticks (block heights on Tempo).
 const REGISTER_AT: u64 = 100;
 const ADMIT_AT: u64 = 105;
-const ADMISSION_DELAY: u64 = 10;
-const CHALLENGE_DURATION: u64 = 20;
 const ADMISSION_DEADLINE: u64 = REGISTER_AT + ADMISSION_DELAY;
 const CHALLENGE_DEADLINE: u64 = ADMISSION_DEADLINE + CHALLENGE_DURATION;
 /// Finalization requires a time strictly after the challenge deadline.
 const FINALIZE_AT: u64 = CHALLENGE_DEADLINE + 1;
-const DEPOSIT_INCLUSION_TIMEOUT: u64 = 100;
-const MINIMUM_WITHDRAWAL_NOTICE: u64 = 50;
-const MAXIMUM_WITHDRAWAL_NOTICE: u64 = 1_000;
 const WITHDRAWAL_DEADLINE: u64 = 400;
-const MAX_DESTINATION_BYTES: usize = 256;
-const MAX_DEPOSIT_IDS: usize = 1_024;
-const MAX_CHALLENGE_BYTES: usize = 64 * 1024;
 
 /// Committee indices whose votes form the certificate. Three of four is the terminal example's
 /// consensus quorum (the crate itself accepts f + 1 = 2), and skipping index 1 makes the signer
 /// bitmap non-contiguous.
 const SIGNING_VALIDATORS: [usize; 3] = [0, 2, 3];
-const VALIDATORS: usize = 4;
 
 /// Upstream leaves proof-of-possession checks to the embedding and defines no namespace for
 /// them, so the fixture fixes one. The contract must use the same bytes.
 const POP_NAMESPACE: &[u8] = b"_PARADIGMHACK_BAJILLION_VALIDATOR_POP";
-/// Domain for deriving validator scalars from the fixture seed.
-const VALIDATOR_KEY_DST: &[u8] = b"_PARADIGMHACK_BAJILLION_FIXTURE_VALIDATOR_KEY";
-/// The terminal example's deployment-identity namespace (examples/terminal/src/protocol.rs).
-const DEPLOYMENT_NAMESPACE: &[u8] = b"_COMMONWARE_EXAMPLES_TERMINAL_DEPLOYMENT";
 /// Inline literal in `ProposalId::for_dealing`; upstream exports no constant for it.
 const PROPOSAL_ID_NAMESPACE: &[u8] = b"_COMMONWARE_CLEARING_PROPOSAL_ID";
 
@@ -138,12 +119,6 @@ const PROPOSAL_ID_NAMESPACE: &[u8] = b"_COMMONWARE_CLEARING_PROPOSAL_ID";
 const CHALLENGED_PAYER: &str = "c";
 
 type Chain = SettlementChain<TracingSha256, Key>;
-
-struct Account {
-    name: &'static str,
-    signer: SigningKey,
-    key: Key,
-}
 
 /// Collects fixture files and the manifest while the scenario runs.
 #[derive(Default)]
@@ -242,50 +217,11 @@ impl Output {
     }
 }
 
-fn name_of<'a>(accounts: &'a [Account], key: &Key) -> &'a str {
-    accounts
-        .iter()
-        .find(|account| &account.key == key)
-        .map(|account| account.name)
-        .expect("key belongs to a fixture account")
-}
-
-fn account<'a>(accounts: &'a [Account], name: &str) -> &'a Account {
-    accounts
-        .iter()
-        .find(|account| account.name == name)
-        .expect("fixture account exists")
-}
-
 /// The message every ed25519 signature over a send covers: the body then the predecessor.
 fn send_message(body: &VectorSendBody<Key, Digest>, predecessor: &VectorRoot<Digest>) -> Vec<u8> {
     let mut message = body.encode().to_vec();
     message.extend_from_slice(&predecessor.encode());
     message
-}
-
-/// Signs and countersigns one vector endpoint, mirroring `acknowledge` in the upstream
-/// `clearing/src/bajillion/tests/challenges.rs`.
-fn acknowledge(
-    context: &CloseContext<Key, Digest>,
-    payer: &SigningKey,
-    operator: &SigningKey,
-    vector: &OutVector<Key>,
-    seq: u64,
-    debit: u64,
-) -> VectorAck<Key, Digest> {
-    VectorAck::sign_by_authorities(
-        VectorSendBody::new(
-            context.payment(),
-            payer.public_key(),
-            seq,
-            debit,
-            vector.root::<Sha256, Digest>().unwrap(),
-        ),
-        commitment::empty_root::<Sha256>(VectorKind::OutEntry),
-        payer,
-        operator,
-    )
 }
 
 fn bls_point(compressed: &[u8]) -> Value {
@@ -329,70 +265,17 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
     let mut out = Output::default();
     let mut rng = TestRng::new(FIXTURE_SEED);
 
-    // Keys. Signer::from_seed is the derivation the upstream test helpers use for accounts and
-    // the operator.
-    let operator = SigningKey::from_seed(FIXTURE_SEED);
-    let accounts = ACCOUNTS
-        .iter()
-        .enumerate()
-        .map(|(index, (name, _))| {
-            let signer = SigningKey::from_seed(FIXTURE_SEED + 1 + index as u64);
-            Account {
-                name,
-                key: signer.public_key(),
-                signer,
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut validators = (0..VALIDATORS)
-        .map(|index| {
-            let mut ikm = FIXTURE_SEED.to_be_bytes().to_vec();
-            ikm.extend_from_slice(&(index as u64).to_be_bytes());
-            let private = Private::new(Scalar::map(VALIDATOR_KEY_DST, &ikm));
-            (compute_public::<MinSig>(&private), private)
-        })
-        .collect::<Vec<_>>();
-    // Committee order is canonical key order; certificate signer indices refer to it.
-    validators.sort_unstable_by_key(|(public, _)| *public);
-    let committee = Committee::new(validators.iter().map(|(public, _)| *public).collect())
-        .expect("4 distinct validators form a 3f+1 committee");
+    let fixture = Deployment::new(FIXTURE_SEED);
+    let operator = &fixture.operator;
+    let accounts = &fixture.accounts;
+    let validators = &fixture.validators;
+    let committee = &fixture.committee;
     let committee_commitment = committee.commitment::<Sha256>();
-    let deployment = Sha256::hash(&[DEPLOYMENT_NAMESPACE, &operator.public_key().encode()]);
+    let deployment = fixture.deployment;
 
     // Genesis state shared by the operator, every validator, and the settlement chain.
-    let balances = ACCOUNTS
-        .iter()
-        .zip(&accounts)
-        .map(|((_, balance), account)| (account.key.clone(), *balance))
-        .collect::<Vec<_>>();
-    let replica = genesis_replica::<Sha256>(runtime.child("replica"), "replica", &balances).await;
-    let mut genesis_accounts = balances
-        .iter()
-        .map(|(key, balance)| {
-            (
-                account_key(key).unwrap(),
-                NonZeroU64::new(*balance).unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    genesis_accounts.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let genesis = Genesis::new(
-        replica.state().root(),
-        replica.state().head().operations(),
-        &genesis_accounts,
-    )
-    .unwrap();
-    let config = SettlementConfig::new(
-        EpochDeadlinePolicy::new(
-            NonZeroU64::new(ADMISSION_DELAY).unwrap(),
-            NonZeroU64::new(CHALLENGE_DURATION).unwrap(),
-        ),
-        NonZeroU64::new(DEPOSIT_INCLUSION_TIMEOUT).unwrap(),
-        NonZeroU64::new(MINIMUM_WITHDRAWAL_NOTICE).unwrap(),
-        NonZeroU64::new(MAXIMUM_WITHDRAWAL_NOTICE).unwrap(),
-        MAX_DESTINATION_BYTES,
-        NonZeroUsize::new(MAX_DEPOSIT_IDS).unwrap(),
-    );
+    let (replica, genesis) = fixture.genesis(runtime.child("replica"), "replica").await;
+    let config = settlement_config();
     let (chain, new_trace) = record(|| {
         Chain::new(
             deployment,
@@ -411,7 +294,7 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
     );
 
     // Registration: an empty deposit boundary and one operator-carried withdrawal.
-    let withdrawer = account(&accounts, WITHDRAWER);
+    let withdrawer = fixture.account(WITHDRAWER);
     let withdrawal = SignedWithdrawal::sign(
         deployment,
         Bytes::copy_from_slice(&WITHDRAWAL_DESTINATION),
@@ -470,8 +353,8 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
     let mut acks: BTreeMap<&str, Vec<VectorAck<Key, Digest>>> = BTreeMap::new();
     let mut payment_records = Vec::new();
     for (from, to, amount) in PAYMENTS {
-        let payer = account(&accounts, from);
-        let recipient = account(&accounts, to).key.clone();
+        let payer = fixture.account(from);
+        let recipient = fixture.account(to).key.clone();
         let entries = vectors.entry(from).or_default();
         match entries
             .iter_mut()
@@ -492,7 +375,7 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
         let debit = vector.totals().unwrap().0;
         let history = acks.entry(from).or_default();
         let seq = history.len() as u64;
-        let ack = acknowledge(&context, &payer.signer, &operator, &vector, seq, debit);
+        let ack = acknowledge(&context, &payer.signer, operator, &vector, seq, debit);
         ack.verify(context.payment()).unwrap();
         let message = send_message(ack.body(), &ack.predecessor());
         let label = format!("ack_{from}_seq{seq}");
@@ -557,7 +440,7 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
     let (dealing, dealing_trace) = record(|| {
         prepare_dealing::<TracingSha256, Key, Digest>(
             context.epoch_context(),
-            &operator,
+            operator,
             &deposits,
             &withdrawals,
             terminals.clone(),
@@ -706,7 +589,7 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
     assert_eq!(applied.header, header);
     assert_eq!(replica.state().root(), roots.successor);
     for (name, balance) in EXPECTED_FINAL {
-        let key = &account(&accounts, name).key;
+        let key = &fixture.account(name).key;
         let stored = replica
             .state()
             .get(&account_key(key).unwrap())
@@ -719,7 +602,7 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
     // Challenge evidence against the admitted close, built as challenges.rs does.
     let range = roots.activity_range(&context).unwrap();
     let epoch = Epoch::at(replica.logs(), EPOCH, range).await.unwrap();
-    let payer = account(&accounts, CHALLENGED_PAYER);
+    let payer = fixture.account(CHALLENGED_PAYER);
     let lookup = epoch
         .account_lookup(replica.logs(), &payer.key)
         .await
@@ -741,7 +624,7 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
     let higher = acknowledge(
         &context,
         &payer.signer,
-        &operator,
+        operator,
         &retained,
         committed_seq + 1,
         retained_debit,
@@ -750,7 +633,7 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
     let fork = acknowledge(
         &context,
         &payer.signer,
-        &operator,
+        operator,
         &retained,
         committed_seq,
         retained_debit,
@@ -1244,12 +1127,12 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
         .map(|terminal| {
             let body = terminal.authorization.body();
             json!({
-                "payer": name_of(&accounts, body.payer()),
+                "payer": fixture.name_of(body.payer()),
                 "seq": body.seq(),
                 "cumulative_debit": body.cumulative_debit(),
                 "send_root": hex(body.send_root().encode()),
                 "entries": terminal.vector.entries().iter().map(|entry| json!({
-                    "recipient": name_of(&accounts, &entry.recipient),
+                    "recipient": fixture.name_of(&entry.recipient),
                     "cumulative": entry.cumulative,
                     "count": entry.count,
                 })).collect::<Vec<_>>(),
