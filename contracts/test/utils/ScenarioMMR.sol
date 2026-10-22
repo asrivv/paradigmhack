@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pragma solidity ^0.8.36;
 
-// TEMPORARY VECTORS. A Solidity model of a keyless QMDB MMR payout log, used only until
-// offchain/fixtures provides crate-generated payout logs. It follows
-// storage/src/merkle/hasher.rs:94-139 (BackwardFold root) and storage/src/merkle/proof.rs:800-1005
-// (single-element proof layout) at dd6d60cb; LibQMDBCommon.verify acts as the oracle in tests.
+// Scenario generator, not a conformance vector. A Solidity model of a keyless QMDB MMR payout log
+// following storage/src/merkle/hasher.rs:94-139 (BackwardFold root) and
+// storage/src/merkle/proof.rs:800-1005 (single-element proof layout) at dd6d60cb. The crate fixture
+// covers a three-operation payout log; claim-order and range scenarios need larger logs.
+// ScenarioAnchors.t.sol checks that this model reproduces the fixture's payout head, opening and
+// claim bytes exactly.
 
-library TmpMMR {
+library ScenarioMMR {
     /// @dev Variable keyless operations (storage/src/qmdb/keyless/operation/variable.rs:15-26).
     function appendOutput(address destination, uint64 amount) internal pure returns (bytes memory) {
         return abi.encodePacked(hex"01", output(destination, amount));

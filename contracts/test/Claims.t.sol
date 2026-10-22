@@ -5,11 +5,11 @@ import { Test } from "forge-std/Test.sol";
 import { StdInvariant } from "forge-std/StdInvariant.sol";
 import { BajillionSettlement } from "../src/BajillionSettlement.sol";
 import { SettlementBase } from "./SettlementBase.sol";
-import { SettlementHarness } from "./tmp/SettlementHarness.sol";
-import { TmpMMR } from "./tmp/TmpMMR.sol";
+import { SettlementHarness } from "./harness/SettlementHarness.sol";
+import { ScenarioMMR } from "./utils/ScenarioMMR.sol";
 import { MockTIP20 } from "./mocks/MockTIP20.sol";
 
-/// @dev A synthetic finalized payout log (TEMPORARY, see test/tmp/).
+/// @dev A synthetic finalized payout log from ScenarioMMR.
 abstract contract PayoutLogFixture is SettlementBase {
     bytes[] internal ops;
     uint64 internal headFloor;
@@ -25,27 +25,27 @@ abstract contract PayoutLogFixture is SettlementBase {
 
     /// @dev Append `count` outputs and a trailing commit, then install the head in the harness.
     function _installLog(uint256 count, uint8 floor) internal {
-        if (ops.length == 0) ops.push(TmpMMR.commit(0));
+        if (ops.length == 0) ops.push(ScenarioMMR.commit(0));
         uint64 reserve;
         for (uint256 i; i < count; ++i) {
             uint256 loc = ops.length;
-            ops.push(TmpMMR.appendOutput(_destination(loc), _amount(loc)));
+            ops.push(ScenarioMMR.appendOutput(_destination(loc), _amount(loc)));
             reserve += _amount(loc);
             ++outputs;
         }
-        ops.push(TmpMMR.commit(floor));
+        ops.push(ScenarioMMR.commit(floor));
         headFloor = floor;
         bytes[] memory all = ops;
-        uint256 inactive = TmpMMR.inactivePeaks(all.length, floor);
+        uint256 inactive = ScenarioMMR.inactivePeaks(all.length, floor);
         token.mint(address(settlement), reserve);
-        settlement.exposedInstallPayouts(TmpMMR.root(all, inactive), uint64(all.length), floor, reserve);
+        settlement.exposedInstallPayouts(ScenarioMMR.root(all, inactive), uint64(all.length), floor, reserve);
     }
 
     function _claimBytes(uint256 loc) internal view returns (bytes memory) {
         bytes[] memory all = ops;
-        uint256 inactive = TmpMMR.inactivePeaks(all.length, headFloor);
-        return TmpMMR.claim(
-            _destination(loc), _amount(loc), uint64(loc), all.length, inactive, TmpMMR.proof(all, inactive, loc)
+        uint256 inactive = ScenarioMMR.inactivePeaks(all.length, headFloor);
+        return ScenarioMMR.claim(
+            _destination(loc), _amount(loc), uint64(loc), all.length, inactive, ScenarioMMR.proof(all, inactive, loc)
         );
     }
 
@@ -137,8 +137,8 @@ contract ClaimsTest is PayoutLogFixture {
         settlement.claimWithdrawal(0, c);
 
         // An opening against a head that is not finalized: append an output without installing.
-        ops.push(TmpMMR.appendOutput(_destination(99), 1));
-        ops.push(TmpMMR.commit(0));
+        ops.push(ScenarioMMR.appendOutput(_destination(99), 1));
+        ops.push(ScenarioMMR.commit(0));
         bytes memory pending = _claimBytes(ops.length - 2);
         uint64 pendingHint = settlement.exposedPredecessor(uint64(ops.length - 2));
         vm.expectRevert(BajillionSettlement.ClaimUnavailable.selector);
@@ -160,9 +160,9 @@ contract ClaimsTest is PayoutLogFixture {
         // Wrong leaf count or inactive-peak boundary.
         bytes32[] memory digests = new bytes32[](0);
         vm.expectRevert(BajillionSettlement.ClaimProof.selector);
-        settlement.claimWithdrawal(0, TmpMMR.claim(_destination(1), _amount(1), 1, ops.length + 1, 0, digests));
+        settlement.claimWithdrawal(0, ScenarioMMR.claim(_destination(1), _amount(1), 1, ops.length + 1, 0, digests));
         vm.expectRevert(BajillionSettlement.ClaimProof.selector);
-        settlement.claimWithdrawal(0, TmpMMR.claim(_destination(1), _amount(1), 1, ops.length, 1, digests));
+        settlement.claimWithdrawal(0, ScenarioMMR.claim(_destination(1), _amount(1), 1, ops.length, 1, digests));
 
         // Malformed encodings.
         c = _claimBytes(1);
@@ -203,11 +203,11 @@ contract ClaimsTest is PayoutLogFixture {
         // Drain the reserve accounting below one output with a second, unfunded head.
         SettlementHarness fresh = _deploy(_args());
         bytes[] memory log = new bytes[](3);
-        log[0] = TmpMMR.commit(0);
-        log[1] = TmpMMR.appendOutput(_destination(1), 50);
-        log[2] = TmpMMR.commit(0);
-        fresh.exposedInstallPayouts(TmpMMR.root(log, 0), 3, 0, 49);
-        bytes memory c = TmpMMR.claim(_destination(1), 50, 1, 3, 0, TmpMMR.proof(log, 0, 1));
+        log[0] = ScenarioMMR.commit(0);
+        log[1] = ScenarioMMR.appendOutput(_destination(1), 50);
+        log[2] = ScenarioMMR.commit(0);
+        fresh.exposedInstallPayouts(ScenarioMMR.root(log, 0), 3, 0, 49);
+        bytes memory c = ScenarioMMR.claim(_destination(1), 50, 1, 3, 0, ScenarioMMR.proof(log, 0, 1));
         vm.expectRevert(BajillionSettlement.ClaimReserve.selector);
         fresh.claimWithdrawal(0, c);
     }
@@ -219,7 +219,7 @@ contract ClaimsTest is PayoutLogFixture {
         delete ops;
         outputs = 0;
         _installLog(13, 8); // 15 leaves: peaks 8, 4, 2, 1; floor 8 makes one peak inactive.
-        assertEq(TmpMMR.inactivePeaks(15, 8), 1);
+        assertEq(ScenarioMMR.inactivePeaks(15, 8), 1);
         for (uint256 loc = 1; loc <= 13; ++loc) {
             _claim(loc);
         }

@@ -5,7 +5,7 @@ import { LibBLS12381 as BLS } from "commonware/certificate/LibBLS12381.sol";
 import { BajillionSettlement } from "../src/BajillionSettlement.sol";
 import { LibBLS12381Point } from "../src/verify/LibBLS12381Point.sol";
 import { SettlementBase } from "./SettlementBase.sol";
-import { TmpBLS } from "./tmp/TmpBLS.sol";
+import { ScenarioBLS } from "./utils/ScenarioBLS.sol";
 
 contract PointWrapper {
     function matchesG1(bytes memory c, bytes memory u) external pure returns (bool) {
@@ -104,8 +104,8 @@ contract BajillionSettlementTest is SettlementBase {
         vm.expectRevert(BajillionSettlement.ContextEncoding.selector);
         settlement.registerEpoch(bytes.concat(ctx, hex"00"), 0, hex"00", hex"00", "");
 
-        vm.expectRevert(BajillionSettlement.WithdrawalsUnsupported.selector);
-        settlement.registerEpoch(ctx, 0, hex"00", hex"0100", "");
+        // Production's empty-withdrawal rule is tested in test_Inv09_ProductionRejectsSignedWithdrawalForNow;
+        // this suite runs on the harness, which decodes withdrawal batches.
 
         vm.expectRevert(BajillionSettlement.IntakeRange.selector);
         settlement.registerEpoch(ctx, 1, hex"00", hex"00", "");
@@ -177,10 +177,10 @@ contract BajillionSettlementTest is SettlementBase {
 
         // A signer counted twice: the aggregate holds signer 0 twice but the bitmap names 0 and 1.
         a = _admission(hex"00", 0x03);
-        BLS.G1Point memory s0 = TmpBLS.sign(secretKeys[0], HEADER_NAMESPACE, abi.encodePacked(a.header));
-        BLS.G1Point memory doubled = TmpBLS.addG1(s0, s0);
-        a.certificate = abi.encodePacked(uint64(N), uint8(0x03), TmpBLS.compressG1(doubled));
-        a.signature = TmpBLS.uncompressedG1(doubled);
+        BLS.G1Point memory s0 = ScenarioBLS.sign(secretKeys[0], HEADER_NAMESPACE, abi.encodePacked(a.header));
+        BLS.G1Point memory doubled = ScenarioBLS.addG1(s0, s0);
+        a.certificate = abi.encodePacked(uint64(N), uint8(0x03), ScenarioBLS.compressG1(doubled));
+        a.signature = ScenarioBLS.uncompressedG1(doubled);
         vm.expectRevert(BajillionSettlement.InvalidCertificate.selector);
         settlement.admit(a);
 
@@ -381,18 +381,18 @@ contract BajillionSettlementTest is SettlementBase {
     function test_RejectsCommitteeWithOneBadProofOfPossession() public {
         SettlementHarnessDeployer deployer = new SettlementHarnessDeployer();
         BajillionSettlement.DeploymentArgs memory d = _args();
-        BLS.G1Point memory wrong = TmpBLS.proveKey(secretKeys[1], POP_NAMESPACE, compressedKeys[2]);
-        d.committee[2].pop = TmpBLS.compressG1(wrong);
-        d.committee[2].popPoint = TmpBLS.uncompressedG1(wrong);
+        BLS.G1Point memory wrong = ScenarioBLS.proveKey(secretKeys[1], POP_NAMESPACE, compressedKeys[2]);
+        d.committee[2].pop = ScenarioBLS.compressG1(wrong);
+        d.committee[2].popPoint = ScenarioBLS.uncompressedG1(wrong);
         token.mint(address(this), BOND);
         vm.expectRevert(BajillionSettlement.InvalidProofOfPossession.selector);
         deployer.deploy(d);
 
         // A proof over another namespace is also rejected.
         d = _args();
-        BLS.G1Point memory other = TmpBLS.proveKey(secretKeys[0], "other", compressedKeys[0]);
-        d.committee[0].pop = TmpBLS.compressG1(other);
-        d.committee[0].popPoint = TmpBLS.uncompressedG1(other);
+        BLS.G1Point memory other = ScenarioBLS.proveKey(secretKeys[0], "other", compressedKeys[0]);
+        d.committee[0].pop = ScenarioBLS.compressG1(other);
+        d.committee[0].popPoint = ScenarioBLS.uncompressedG1(other);
         vm.expectRevert(BajillionSettlement.InvalidProofOfPossession.selector);
         deployer.deploy(d);
     }
@@ -434,32 +434,32 @@ contract BajillionSettlementTest is SettlementBase {
             hex"97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
         bytes memory g2 =
             hex"93e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8";
-        BLS.G1Point memory gen1 = TmpBLS.g1Generator();
-        BLS.G2Point memory gen2 = TmpBLS.g2Generator();
-        assertEq(TmpBLS.compressG1(gen1), g1);
-        assertEq(TmpBLS.compressG2(gen2), g2);
-        assertTrue(w.matchesG1(g1, TmpBLS.uncompressedG1(gen1)));
+        BLS.G1Point memory gen1 = ScenarioBLS.g1Generator();
+        BLS.G2Point memory gen2 = ScenarioBLS.g2Generator();
+        assertEq(ScenarioBLS.compressG1(gen1), g1);
+        assertEq(ScenarioBLS.compressG2(gen2), g2);
+        assertTrue(w.matchesG1(g1, ScenarioBLS.uncompressedG1(gen1)));
         assertTrue(w.matchesG2(g2, gen2));
 
         // Negated generators set the sign bit (0x20).
-        BLS.G1Point memory neg1 = TmpBLS.mulG1(gen1, _groupOrder() - 1);
+        BLS.G1Point memory neg1 = ScenarioBLS.mulG1(gen1, _groupOrder() - 1);
         bytes memory negG1 = bytes.concat(g1);
         negG1[0] = 0xb7;
-        assertEq(TmpBLS.compressG1(neg1), negG1);
-        assertTrue(w.matchesG1(negG1, TmpBLS.uncompressedG1(neg1)));
-        assertFalse(w.matchesG1(g1, TmpBLS.uncompressedG1(neg1)), "sign bit is bound");
+        assertEq(ScenarioBLS.compressG1(neg1), negG1);
+        assertTrue(w.matchesG1(negG1, ScenarioBLS.uncompressedG1(neg1)));
+        assertFalse(w.matchesG1(g1, ScenarioBLS.uncompressedG1(neg1)), "sign bit is bound");
 
-        BLS.G2Point memory neg2 = TmpBLS.mulG2(gen2, _groupOrder() - 1);
+        BLS.G2Point memory neg2 = ScenarioBLS.mulG2(gen2, _groupOrder() - 1);
         bytes memory negG2 = bytes.concat(g2);
         negG2[0] = 0xb3;
-        assertEq(TmpBLS.compressG2(neg2), negG2);
+        assertEq(ScenarioBLS.compressG2(neg2), negG2);
         assertTrue(w.matchesG2(negG2, neg2));
         assertFalse(w.matchesG2(g2, neg2), "sign bit is bound");
 
         // Infinity and stray flags never match.
         bytes memory inf = bytes.concat(g1);
         inf[0] = bytes1(uint8(inf[0]) | 0x40);
-        assertFalse(w.matchesG1(inf, TmpBLS.uncompressedG1(gen1)));
+        assertFalse(w.matchesG1(inf, ScenarioBLS.uncompressedG1(gen1)));
         bytes memory flagged = bytes.concat(g2);
         flagged[48] = bytes1(uint8(flagged[48]) | 0x80);
         assertFalse(w.matchesG2(flagged, gen2));

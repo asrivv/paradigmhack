@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 pragma solidity ^0.8.36;
 
-// TEMPORARY VECTORS. Everything in contracts/test/tmp/ is synthetic data generated in Solidity
-// for this pass. Replace with crate output from offchain/fixtures (contracts/test/fixtures/) once
-// that branch lands; until then these vectors prove internal consistency, not crate conformance.
-// The compression helpers below are anchored to the standard generator encodings in
-// test_PointCompressionKnownVectors.
+// Scenario generator, not a conformance vector. The crate fixtures in test/fixtures/ cover one
+// certified epoch, and their validator secret keys are not published, so multi-epoch and
+// adversarial certificate scenarios sign with this generator's own committee. ScenarioAnchors.t.sol
+// checks that its hashing and compression reproduce the crate's bytes for the fixture inputs.
 
 import { LibBLS12381 as BLS } from "commonware/certificate/LibBLS12381.sol";
 import { LibBLS12381PoP } from "../../src/verify/LibBLS12381PoP.sol";
 
-library TmpBLS {
+library ScenarioBLS {
     uint256 internal constant HALF_HI = 0x0d0088f51cbff34d258dd3db21a5d66b;
     uint256 internal constant HALF_LO = 0xb23ba5c279c2895fb39869507b587b120f55ffff58a9ffffdcff7fffffffd555;
 

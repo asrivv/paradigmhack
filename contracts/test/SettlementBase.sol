@@ -5,11 +5,11 @@ import { Test } from "forge-std/Test.sol";
 import { LibBLS12381 as BLS } from "commonware/certificate/LibBLS12381.sol";
 import { BajillionSettlement } from "../src/BajillionSettlement.sol";
 import { LibVectorCommitment as Vector } from "../src/verify/LibVectorCommitment.sol";
-import { SettlementHarness } from "./tmp/SettlementHarness.sol";
-import { TmpBLS } from "./tmp/TmpBLS.sol";
+import { SettlementHarness } from "./harness/SettlementHarness.sol";
+import { ScenarioBLS } from "./utils/ScenarioBLS.sol";
 import { MockTIP20 } from "./mocks/MockTIP20.sol";
 
-/// @dev Shared deployment and close construction. All vectors are TEMPORARY (see test/tmp/).
+/// @dev Shared deployment and close construction. Scenario data comes from test/utils/ generators; crate conformance is in Conformance.t.sol.
 abstract contract SettlementBase is Test {
     bytes internal constant HEADER_ROOT_NAMESPACE = "_COMMONWARE_CLEARING_HEADER_ROOT";
     bytes internal constant EPOCH_ANCHOR_NAMESPACE = "_COMMONWARE_CLEARING_EPOCH_ANCHOR";
@@ -48,7 +48,7 @@ abstract contract SettlementBase is Test {
         bytes[] memory keys = new bytes[](N);
         for (uint256 i; i < N; ++i) {
             sks[i] = i + 1;
-            keys[i] = TmpBLS.compressG2(TmpBLS.mulG2(TmpBLS.g2Generator(), sks[i]));
+            keys[i] = ScenarioBLS.compressG2(ScenarioBLS.mulG2(ScenarioBLS.g2Generator(), sks[i]));
         }
         // Sort by compressed bytes, as `Committee::new` orders members.
         for (uint256 i; i < N; ++i) {
@@ -62,7 +62,7 @@ abstract contract SettlementBase is Test {
         for (uint256 i; i < N; ++i) {
             secretKeys.push(sks[i]);
             compressedKeys.push(keys[i]);
-            points.push(TmpBLS.mulG2(TmpBLS.g2Generator(), sks[i]));
+            points.push(ScenarioBLS.mulG2(ScenarioBLS.g2Generator(), sks[i]));
         }
     }
 
@@ -79,9 +79,9 @@ abstract contract SettlementBase is Test {
         d.popNamespace = POP_NAMESPACE;
         d.committee = new BajillionSettlement.Validator[](N);
         for (uint256 i; i < N; ++i) {
-            BLS.G1Point memory pop = TmpBLS.proveKey(secretKeys[i], POP_NAMESPACE, compressedKeys[i]);
+            BLS.G1Point memory pop = ScenarioBLS.proveKey(secretKeys[i], POP_NAMESPACE, compressedKeys[i]);
             d.committee[i] = BajillionSettlement.Validator(
-                compressedKeys[i], points[i], TmpBLS.compressG1(pop), TmpBLS.uncompressedG1(pop)
+                compressedKeys[i], points[i], ScenarioBLS.compressG1(pop), ScenarioBLS.uncompressedG1(pop)
             );
         }
     }
@@ -175,12 +175,12 @@ abstract contract SettlementBase is Test {
         bool first = true;
         for (uint256 i; i < N; ++i) {
             if (signers & (1 << i) == 0) continue;
-            BLS.G1Point memory s = TmpBLS.sign(secretKeys[i], HEADER_NAMESPACE, abi.encodePacked(header));
-            aggregate = first ? s : TmpBLS.addG1(aggregate, s);
+            BLS.G1Point memory s = ScenarioBLS.sign(secretKeys[i], HEADER_NAMESPACE, abi.encodePacked(header));
+            aggregate = first ? s : ScenarioBLS.addG1(aggregate, s);
             first = false;
         }
-        certificate = abi.encodePacked(uint64(N), signers, TmpBLS.compressG1(aggregate));
-        signature = TmpBLS.uncompressedG1(aggregate);
+        certificate = abi.encodePacked(uint64(N), signers, ScenarioBLS.compressG1(aggregate));
+        signature = ScenarioBLS.uncompressedG1(aggregate);
     }
 
     function _admission(bytes memory deposits, uint8 signers)

@@ -1,8 +1,11 @@
 {
-  "admit_n4_q2": "305544",
+  "admit_fixture_n4_signers3_oneWithdrawal": "331323",
+  "admit_n4_q2": "306667",
+  "claimWithdrawal_fixture_3leaves": "80476",
   "claimWithdrawal_mergeBoth_10leaves": "52383",
   "claimWithdrawal_newRange_10leaves": "74582",
   "deposit_firstForAccount": "174875",
   "finalize": "71452",
-  "registerEpoch_oneDeposit": "202248"
+  "finalize_fixture": "114052",
+  "registerEpoch_oneDeposit": "203260"
 }
