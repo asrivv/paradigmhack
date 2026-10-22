@@ -411,10 +411,19 @@ commonware-sol, and how `contracts/src/BajillionSettlement.sol` resolves them.
 | Certificates carry a 48-byte compressed G1 signature; `verifyMinSig` needs 96 uncompressed bytes | `admit` takes the crate's exact certificate bytes plus an uncompressed hint and checks the hint compresses to them (`src/verify/LibBLS12381Point.sol`). The pairing precompile then checks curve and subgroup membership |
 | Committee keys are 96-byte compressed G2; `verifyMinSig` needs EIP-2537 `G2Point`s | Same hint check at construction. Keys are not stored (8 new slots each on Tempo); `admit` takes them as calldata against a stored keccak256 |
 | commonware-sol has no proof-of-possession verifier | `src/verify/LibBLS12381PoP.sol` copies upstream hash-to-curve with the `BLS_POP_` DST. The PoP namespace is a deployment parameter |
-| Withdrawals are Ed25519-signed; the EVM has no Ed25519 precompile | Withdrawal batches must be empty in this pass (`WithdrawalsUnsupported`) |
+| Withdrawals are Ed25519-signed; the EVM has no Ed25519 precompile | `_withdrawalBoundary` accepts only the empty batch in this pass (`WithdrawalsUnsupported`). The test harness overrides it to compute the real root without the signature check, so the crate fixture epoch exercises every other production check |
 | `SettlementChain` has no bond | The constructor escrows a bond outside custody accounting. Nothing reads it yet |
 | A revert discards the liveness fence | Once a call writes the fence it returns a `Status` and emits `HardFault` instead of reverting |
 | The embedding supplies the pulled deposit aggregate | The contract keeps a hash chain over deposits and requires the aggregate to match exactly |
 | Claimed ranges come from an authenticated ordered map | A linked list keyed by range start; the caller names the predecessor and the contract checks it in O(1) |
 | Unbounded queues of registrations and admitted closes | A 64-epoch ring; `registerEpoch` reverts with `PipelineFull` past it |
 | Clock | `block.timestamp` |
+
+### Behaviour inherited from commonware-sol
+
+`LibBLS12381._pairing` and the hash-to-curve helpers call EIP-2537 precompiles with `gas()`. A
+precompile error, such as a hint coordinate that is not on the curve, consumes all gas forwarded
+to it. `admit` with a malformed signature hint therefore still reverts with `InvalidCertificate`,
+but only after burning 63/64 of the caller's gas. Only the submitter pays and no state changes.
+`test_Inv09_RejectsMutatedCertificate` caps gas per call for this reason. This is worth raising
+upstream.
