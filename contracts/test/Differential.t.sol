@@ -201,6 +201,26 @@ contract DifferentialTest is Test {
         assertTrue(succeeded[CHALLENGE], "no challenge succeeded");
     }
 
+    /// @notice Regression: a registration whose deposit batch credits less than the deposits it
+    /// pulls. The skipped registration before it pulled deposits in the materializing run but not
+    /// in the replay, so the replayed `end` pulls them uncredited. Upstream cannot detect this
+    /// (it keeps no per-deposit amounts and only panics on over-crediting, settlement.rs:1290-1308)
+    /// and accepted it; the contract rejects it with `DepositAggregate`. The oracle was wrong:
+    /// the embedding owes upstream the exact aggregate (settlement.rs:14-16), and it now reports
+    /// both violations as 1004. Seeds and op indices from the first 1,000-seed survey.
+    function test_Differential_Inv10_Regression_InexactDepositAggregate() public {
+        uint64[4] memory seeds = [uint64(28), 73, 99, 242];
+        uint256[4] memory opIndex = [uint256(15), 14, 25, 25];
+        for (uint256 k; k < seeds.length; ++k) {
+            uint256 snapshot = vm.snapshotState();
+            (Op[] memory applied, uint16[] memory statuses) = _differential(seeds[k], generate(seeds[k]));
+            assertEq(applied[opIndex[k]].kind, REGISTER_EPOCH);
+            assertEq(statuses[opIndex[k]], OracleStatus.PRECONDITION, "inexact aggregate must be rejected");
+            vm.revertToState(snapshot);
+            vm.warp(0);
+        }
+    }
+
     /// @notice The crate fixture epoch as concrete ops, ending in a paid claim and a replayed
     /// claim. Its registration carries one signed withdrawal, so the contract side is
     /// `SettlementHarness`, which differs from production only in computing that batch's root
