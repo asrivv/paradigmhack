@@ -1,0 +1,41 @@
+{
+ "settlement": "0xD06cE4d32D5b5f420aaFeD9a39109342cd28b95b",
+ "withdrawalDeadline": 1793057139,
+ "registeredAt": 1793056241,
+ "admissionDeadline": 1793056301,
+ "challengeDeadline": 1793056331,
+ "header": "0xd588870e4cc56ea3e8c59ae0e6614aaa56027c8ca5e196420b89b00a5c368c4e",
+ "steps": [
+  {
+   "method": "registerEpoch",
+   "hash": "0x69bebb82530b0557ebeb2785ad2f1defbf45b13b36b53636c5a3e204dd774a2c",
+   "block": 112,
+   "timestamp": 1793056241,
+   "gasUsed": 1481379
+  },
+  {
+   "method": "admit",
+   "hash": "0x2ab9709285956827c1457581104c27a20ea6c9c145febcb1814671a910b95851",
+   "block": 113,
+   "timestamp": 1793056242,
+   "gasUsed": 483985
+  },
+  {
+   "method": "finalize",
+   "hash": "0x2bf1066f479f1e60b33994d0d62e52ec90390b4f48b30ba7fef0ee92b7452494",
+   "block": 204,
+   "timestamp": 1793056333,
+   "gasUsed": 176756
+  },
+  {
+   "method": "claimWithdrawal",
+   "hash": "0xeaaebb08439ab9303a68adb600d9e70a3144b75235bc0c8591dd46a5d7c010af",
+   "block": 205,
+   "timestamp": 1793056334,
+   "gasUsed": 127756
+  }
+ ],
+ "destinationBalance": 10,
+ "replayRejected": true,
+ "replayError": "Error: server returned an error response: error code 3: execution reverted: custom error 0xf7eb630c, data: \"0xf7eb630c\""
+}

@@ -1,0 +1,141 @@
+{
+ "network": "Tempo Moderato testnet",
+ "chainId": 42431,
+ "rpc": "https://rpc.moderato.tempo.xyz",
+ "settlement": {
+  "address": "0x78F12F6Fbc6d5b5BdC249cb59dAe541fDBee81a9",
+  "block": 41323147,
+  "transaction": "0x6fde21393e405f65cc04970d4951cdecea4643a4758976619a0c1948473070d8",
+  "deployedBytes": 24385,
+  "optimizerRuns": 200
+ },
+ "deployer": "0xC1aE0eBb1f6fcF61FfA4eA88AC5ea719B8AF4099",
+ "commit": "131ddef3331365d1bd80a5a24fb2ce95bd866ebe",
+ "contractSourcesUnchangedSince": "432c103a155b9a18cb9cabf87954f057f5f6e946",
+ "asset": {
+  "symbol": "pathUSD",
+  "address": "0x20C0000000000000000000000000000000000000",
+  "decimals": 6
+ },
+ "demoSettings": {
+  "note": "DEMO SETTINGS, not production: a 30-second challenge window is far too short for real watchers.",
+  "admissionDelay": 60,
+  "challengeDuration": 30,
+  "depositInclusionTimeout": 300,
+  "minimumWithdrawalNotice": 120,
+  "maximumWithdrawalNotice": 3600,
+  "maxDestinationBytes": 256,
+  "maxDepositIds": 1024,
+  "bond": 0,
+  "clock": "block.timestamp (seconds)"
+ },
+ "fixtureDeployment": "offchain/fixtures seed 4664: deployment id, operator, 4-validator BLS12-381 MinSig committee, genesis a=100 b=40 c=25 d=35",
+ "libraries": [
+  {
+   "name": "src/verify/LibEd25519.sol:Ed25519Verifier",
+   "address": "0xfb262a39aaef88c9d783794558158db07f9cf874",
+   "block": 41323093,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/verify/BajillionVerifiers.sol:CertificateVerifier",
+   "address": "0x5cbf2f3718e80af15a004fa8e1655d11ec41dd23",
+   "block": 41323097,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/verify/BajillionVerifiers.sol:PayoutVerifier",
+   "address": "0xeb4c209fee185948e16b523ea13530bae7f251fa",
+   "block": 41323102,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/verify/BajillionVerifiers.sol:AdmissionVerifier",
+   "address": "0x0c36f77fe9de687755a25547a2bac515b20cd295",
+   "block": 41323107,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/verify/WithdrawalVerifiers.sol:WithdrawalCodec",
+   "address": "0x66a528cf9c58c6a0b89b787bf36988a8ae054ff3",
+   "block": 41323112,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/verify/WithdrawalVerifiers.sol:StateVerifier",
+   "address": "0xf5d26bf6546906fc77ccefa7971fa187ffcbe34f",
+   "block": 41323116,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/BajillionChallenge.sol:BajillionChallenge",
+   "address": "0x94735c32e5ae71d9e097e6f376f33bd3cda8334e",
+   "block": 41323118,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/BajillionWithdrawals.sol:BajillionWithdrawals",
+   "address": "0x88f839a0942e7b078ca5c4ddc4beda75ac8e3f3d",
+   "block": 41323123,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/BajillionClaims.sol:BajillionClaims",
+   "address": "0x3dc7960b4e19dc6755e4069a9af63824e2d6fb52",
+   "block": 41323128,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/BajillionLiveness.sol:BajillionLiveness",
+   "address": "0xe32ed883e35db55cd397bff7b45a5fe2da492c9a",
+   "block": 41323133,
+   "optimizerRuns": 1000000
+  },
+  {
+   "name": "src/BajillionRecovery.sol:BajillionRecovery",
+   "address": "0xfdc14d7cc19ece70ab1aa14ee626cf0c8a4f3ae6",
+   "block": 41323137,
+   "optimizerRuns": 1000000
+  }
+ ],
+ "verifiedOnChain": "forge script script/DeployModerato.s.sol --rpc-url moderato --sig 'verify()': every library's code equals its linked 1,000,000-run artifact",
+ "fixtureEpoch": {
+  "registeredAt": 1793055996,
+  "admissionDeadline": 1793056056,
+  "challengeDeadline": 1793056086,
+  "withdrawalDeadline": 1793056895,
+  "header": "0x6f9dd623c3af4724dd539a064008b7baf1e5fe529c043521c3bb14192cb9bb25",
+  "destinationBalance": 10,
+  "replayRejected": true,
+  "steps": [
+   {
+    "method": "registerEpoch",
+    "hash": "0x3292504b6f33869afccca5c543625ee9aad90de7ed98aa883ac569a2ab9f6d29",
+    "block": 41323388,
+    "timestamp": 1793055996,
+    "gasUsed": 3779029
+   },
+   {
+    "method": "admit",
+    "hash": "0x2caa524d5d83513a1df4d20467a812ed2b56d80fee1cc08ca9f77d40d8eb1bbb",
+    "block": 41323394,
+    "timestamp": 1793056000,
+    "gasUsed": 2328112
+   },
+   {
+    "method": "finalize",
+    "hash": "0x56563d73484883696c492760eb75d9dc9271b2c36122809a6fb5d480b4af589f",
+    "block": 41323543,
+    "timestamp": 1793056090,
+    "gasUsed": 869356
+   },
+   {
+    "method": "claimWithdrawal",
+    "hash": "0xd1015b707776991e066f13f368b10b0bcd53451ad47995751b5f949d338b8808",
+    "block": 41323547,
+    "timestamp": 1793056092,
+    "gasUsed": 356117
+   }
+  ]
+ }
+}

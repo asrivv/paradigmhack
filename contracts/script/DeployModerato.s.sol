@@ -37,7 +37,10 @@ contract DeployModerato is ModeratoBase {
     }
 
     Lib[] internal libs;
-    string internal constant PLAN = "../deployments/moderato.plan.json";
+    /// @dev `PLAN_FILE` overrides the plan path, so a local replay keeps its own plan.
+    function _planFile() internal view returns (string memory) {
+        return vm.envOr("PLAN_FILE", string("../deployments/moderato.plan.json"));
+    }
     string internal constant SETTLEMENT_ARTIFACT = "out/BajillionSettlement.sol/BajillionSettlement.json";
 
     function run() external {
@@ -71,26 +74,21 @@ contract DeployModerato is ModeratoBase {
         vm.serializeAddress(root, "pathUSD", PATH_USD);
         vm.serializeString(root, "libraries", _libraryJson());
         string memory json = vm.serializeString(root, "transactions", list);
-        vm.writeJson(json, PLAN);
+        vm.writeJson(json, _planFile());
         console.log("plan written for deployer", deployer);
         console.log("settlement will deploy at", settlement);
     }
 
     /// @notice Check the broadcast deployment against the plan.
     function verify() external view {
-        string memory plan = vm.readFile(PLAN);
+        string memory plan = vm.readFile(_planFile());
         address deployer = vm.parseJsonAddress(plan, ".deployer");
         uint64 nonce = uint64(vm.parseJsonUint(plan, ".startNonce"));
         address settlementAddress = vm.parseJsonAddress(plan, ".settlement");
         Lib[] memory list = _plannedLibraries(deployer, nonce);
         for (uint256 i; i < list.length; ++i) {
             bytes memory expected = _linkedWith(list, list[i].artifact, ".deployedBytecode.object");
-            // A deployed library's code carries its own address after the leading PUSH20, the
-            // call guard Solidity writes at construction.
-            bytes20 self = bytes20(list[i].addr);
-            for (uint256 k; k < 20; ++k) {
-                expected[1 + k] = self[k];
-            }
+            _setDeployAddress(expected, list[i].artifact, list[i].addr);
             require(
                 keccak256(list[i].addr.code) == keccak256(expected),
                 string.concat(list[i].fqn, ": on-chain code differs from its 1,000,000-run artifact")
@@ -153,6 +151,24 @@ contract DeployModerato is ModeratoBase {
         list = new Lib[](names.length);
         for (uint256 i; i < names.length; ++i) {
             list[i] = Lib(names[i][0], names[i][1], vm.computeCreateAddress(deployer, nonce + i));
+        }
+    }
+
+    /// @dev Under via-IR, a library with state-changing functions guards against direct calls
+    /// with an immutable, `library_deploy_address`, which its constructor fills with its own
+    /// address. Write that address at each offset the artifact records; view-only libraries have
+    /// none.
+    function _setDeployAddress(bytes memory code, string memory artifact, address self) internal view {
+        string memory json = vm.readFile(artifact);
+        string memory refs = ".deployedBytecode.immutableReferences.library_deploy_address";
+        for (uint256 k;; ++k) {
+            string memory path = string.concat(refs, "[", vm.toString(k), "].start");
+            if (!vm.keyExistsJson(json, path)) break;
+            uint256 start = vm.parseJsonUint(json, path);
+            bytes32 word = bytes32(uint256(uint160(self)));
+            for (uint256 b; b < 32; ++b) {
+                code[start + b] = word[b];
+            }
         }
     }
 
