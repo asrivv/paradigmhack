@@ -428,3 +428,31 @@ to it. `admit` with a malformed signature hint therefore still reverts with `Inv
 but only after burning 63/64 of the caller's gas. Only the submitter pays and no state changes.
 `test_Inv09_RejectsMutatedCertificate` caps gas per call for this reason. This is worth raising
 upstream.
+
+## 8. Differential testing against SettlementChain
+
+`contracts/test/Differential.t.sol` (invariant 10) runs seed-chosen op sequences through
+`BajillionSettlement` and through `offchain/oracle`, which applies the same bytes to the crate's
+`SettlementChain` with the fixtures deployment. Both sides must report the same status code per
+op, the same mutated-on-error flag (the liveness fence) and the same state digest. The status
+table and digest layout are in `offchain/oracle/README.md`; `test/differential/OracleStatus.sol`
+is the one map from contract errors onto that table.
+
+```sh
+(cd offchain && cargo build --release --locked -p bajillion-oracle)
+(cd contracts && FOUNDRY_PROFILE=differential forge test --match-contract '^DifferentialTest$')
+```
+
+Skipped ops, pinned by `test_Inv10_SkipList`:
+
+| Op | Why |
+|---|---|
+| `queueWithdrawal` | Pending: chain-queued withdrawals are not ported |
+| `registerEpoch` with a nonempty withdrawal batch | Pending: production rejects it until Ed25519 withdrawal verification lands |
+| `recordDeposit` reusing a deposit id | Not applicable: the contract assigns ids, so `DuplicateDeposit` cannot occur |
+
+The deposit aggregate is one place where the contract is stricter than the crate on purpose.
+`register_epoch` can only reject a batch that credits an account more than its unpulled total,
+because it keeps no per-deposit amounts (`settlement.rs:1290-1308`), and it leaves the exact
+aggregate to the embedding (`settlement.rs:14-16`). The contract checks the exact aggregate
+against its inbox hash chain. The oracle, as the embedding, reports both violations as status 1004.
