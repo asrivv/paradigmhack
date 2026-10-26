@@ -229,6 +229,21 @@ contract DifferentialTest is Test {
         }
     }
 
+    /// @notice Regression: seed 37 drains terminal settlement completely at op 29, the fourth
+    /// `claimHardFault`. Upstream's `finish_hard_fault_if_drained` zeroes the finalized liability
+    /// (settlement.rs:2077), and the contract does too, but the oracle mirrors that private field
+    /// and only updated it at finalization, so the digests differed with every status agreeing.
+    /// The oracle was wrong and now zeroes its mirror once settled. Replayed with the generator of
+    /// that survey (`_generateV2`).
+    function test_Differential_Inv10_Regression_SettledLiability() public {
+        (Op[] memory applied, uint16[] memory statuses) = _differential(37, _generateV2(37));
+        assertEq(applied[29].kind, CLAIM_HARD_FAULT);
+        assertEq(statuses[29], OracleStatus.OK);
+        (, bool settled,,,,) = settlement.terminal();
+        assertTrue(settled, "settled");
+        assertEq(settlement.currentLiability(), 0, "settled liability is zero");
+    }
+
     /// @notice The crate fixture epoch as concrete ops, ending in a paid claim and a replayed
     /// claim. Its registration carries one signed withdrawal, so the contract side is
     /// `SettlementHarness`, which differs from production only in computing that batch's root
@@ -308,6 +323,29 @@ contract DifferentialTest is Test {
             else if (r < 68) kind = FINALIZE;
             else if (r < 74) kind = CLAIM_WITHDRAWAL;
             else if (r < 78) kind = FAULT_EXPIRED;
+            else kind = ADVANCE_TIME;
+            ops[i].kind = kind;
+        }
+    }
+
+    /// @dev The generator of the recovery survey (this branch's first): all twelve kinds.
+    function _generateV2(uint64 seed) internal pure returns (Op[] memory ops) {
+        uint256 length = 16 + uint256(keccak256(abi.encode(seed, "length"))) % 48;
+        ops = new Op[](length);
+        for (uint256 i; i < length; ++i) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i))) % 100;
+            uint8 kind;
+            if (r < 13) kind = RECORD_DEPOSIT;
+            else if (r < 20) kind = QUEUE_WITHDRAWAL;
+            else if (r < 31) kind = REGISTER_EPOCH;
+            else if (r < 44) kind = ADMIT;
+            else if (r < 52) kind = CHALLENGE;
+            else if (r < 62) kind = FINALIZE;
+            else if (r < 68) kind = CLAIM_WITHDRAWAL;
+            else if (r < 71) kind = FAULT_EXPIRED;
+            else if (r < 74) kind = BEGIN_HARD_FAULT_SETTLEMENT;
+            else if (r < 78) kind = CLAIM_HARD_FAULT;
+            else if (r < 82) kind = CLAIM_PENDING_DEPOSIT;
             else kind = ADVANCE_TIME;
             ops[i].kind = kind;
         }
