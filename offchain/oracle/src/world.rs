@@ -79,8 +79,14 @@ pub fn run(seed: u64, ops: Vec<Op>) -> Run {
                 op.args.to_vec()
             };
             let before = world.chain.encode();
+            let pruned = observes_time(op.kind).then(|| world.pruned_only());
             let status = world.apply(op.kind, &args).await;
-            mutated_on_error.push(status != status::OK && world.chain.encode() != before);
+            let after = world.chain.encode();
+            mutated_on_error.push(
+                status != status::OK
+                    && after != before
+                    && pruned.flatten().is_none_or(|pruned| after != pruned),
+            );
             statuses.push(status);
             applied.push(Op {
                 kind: op.kind,
@@ -94,6 +100,11 @@ pub fn run(seed: u64, ops: Vec<Op>) -> Run {
             state_digest: world.digest(),
         }
     })
+}
+
+/// Kinds whose upstream call observes `now` first (`observe_time`, settlement.rs:861-874).
+fn observes_time(kind: u8) -> bool {
+    kind <= kind::FINALIZE
 }
 
 fn takes_args(kind: u8) -> bool {
@@ -228,6 +239,21 @@ impl World {
     // ---------------------------------------------------------------------------------------
     // Application
     // ---------------------------------------------------------------------------------------
+
+    /// The state after observing `now` alone, when that observation only prunes expired
+    /// withdrawal replay ids and does not fence. Upstream prunes on every observation, and the
+    /// pruned set's only reader is the intake check, which always follows an observation at the
+    /// same `now`. A port that treats an id as consumed only while its deadline is later than
+    /// `now` answers every check identically without the write, so a failed op whose only change
+    /// is that pruning does not count as mutated on error. `None` when the observation fences,
+    /// since the fence is then a real mutation.
+    fn pruned_only(&self) -> Option<Bytes> {
+        let mut copy = Chain::decode_cfg(self.chain.encode(), &BOUNDS)
+            .expect("settlement state round-trips through its codec");
+        // Observes `now`, then fails decoding the empty challenge without further effect.
+        let _ = copy.challenge_encoded(self.now, BatchId::new(Sha256::hash(&[])), &[], 0);
+        (copy.hard_fault() == self.chain.hard_fault()).then(|| copy.encode())
+    }
 
     async fn apply(&mut self, kind: u8, args: &[u8]) -> u16 {
         let result = match kind {
@@ -523,14 +549,22 @@ impl World {
             opening = self.opening(other).await.or(opening);
         }
         let balance = opening.as_ref().map_or(50, |opening| opening.balance.get());
+        // Amounts and notices land on both sides of each bound, and on the bound itself.
+        let amount = match pick.below(20) {
+            0..=2 => balance,
+            3 => balance + 1,
+            _ => 1 + pick.below(balance + 10),
+        };
         let action = if pick.chance(25) {
             WithdrawalAction::Close
         } else {
-            WithdrawalAction::Amount(NonZeroU64::new(1 + pick.below(balance + 10)).unwrap())
+            WithdrawalAction::Amount(NonZeroU64::new(amount.max(1)).unwrap())
         };
-        let notice = match pick.below(10) {
-            0 => MINIMUM_WITHDRAWAL_NOTICE - 1,
-            1 => MAXIMUM_WITHDRAWAL_NOTICE + 1,
+        let notice = match pick.below(20) {
+            0 | 1 => MINIMUM_WITHDRAWAL_NOTICE - 1,
+            2 | 3 => MAXIMUM_WITHDRAWAL_NOTICE + 1,
+            4 => MINIMUM_WITHDRAWAL_NOTICE,
+            5 => MAXIMUM_WITHDRAWAL_NOTICE,
             _ => {
                 MINIMUM_WITHDRAWAL_NOTICE
                     + pick.below(MAXIMUM_WITHDRAWAL_NOTICE - MINIMUM_WITHDRAWAL_NOTICE + 1)

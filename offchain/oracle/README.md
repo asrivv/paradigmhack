@@ -127,8 +127,9 @@ then admitted:
 - `recordDeposit`: fresh or (15%) previously used ids, fixture or (20%) unfunded accounts,
   amounts 1 to 50 or (10%) zero.
 - `queueWithdrawal`: requests signed by fixture or unknown accounts with openings at the
-  finalized root, sometimes for the wrong account or foreign deployment, notices inside and just
-  outside the configured window, amounts above and below the balance, and `Close` requests.
+  finalized root, sometimes for the wrong account or foreign deployment, notices inside, exactly
+  at and just outside each end of the configured window, amounts below, exactly at and above the
+  balance, and `Close` requests.
 - `registerEpoch`: the exact pulled deposits and due withdrawals for the next epoch, sometimes
   with an extra operator-carried withdrawal, a wrong epoch, an end past intake, a context that
   binds other deposits, or a foreign committee.
@@ -158,7 +159,12 @@ input op in both arrays.
   and after the op. This is the liveness fence: upstream deliberately records an observed
   missed deadline (for example a hard fault for an expired deposit or registration) before
   returning the error. A Solidity port must commit that state instead of reverting. Oracle
-  statuses (1001 to 1004) are always `false`.
+  statuses (1001 to 1004) are always `false`. One change does not count: an observation that
+  only prunes expired withdrawal replay ids. Their one reader is the intake check, which always
+  follows an observation at the same `now`, so a port that treats an id as consumed only while
+  its deadline is later than `now` behaves identically without that write. For ops that observe
+  time, the oracle compares the after-state with the before-state with that pruning applied,
+  computed on a copy.
 - `stateDigest`: SHA-256 of the observable state after the last op (see below).
 
 ## Status codes
