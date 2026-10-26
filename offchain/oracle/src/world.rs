@@ -57,7 +57,7 @@ const MAX_OPENING_DIGESTS: usize = 256;
 /// Maximum records accepted when decoding a deposit or withdrawal batch.
 const MAX_BATCH_RECORDS: usize = 1_024;
 /// Domain tag that starts the state digest preimage.
-pub(crate) const STATE_DIGEST_TAG: &[u8] = b"BAJILLION_ORACLE_STATE_V1";
+pub(crate) const STATE_DIGEST_TAG: &[u8] = b"BAJILLION_ORACLE_STATE_V2";
 
 const BOUNDS: Bounds = Bounds {
     committee: VALIDATORS,
@@ -104,11 +104,14 @@ pub fn run(seed: u64, ops: Vec<Op>) -> Run {
 
 /// Kinds whose upstream call observes `now` first (`observe_time`, settlement.rs:861-874).
 fn observes_time(kind: u8) -> bool {
-    kind <= kind::FINALIZE
+    kind <= kind::FINALIZE || kind == kind::CLAIM_PENDING_DEPOSIT
 }
 
 fn takes_args(kind: u8) -> bool {
-    !matches!(kind, kind::FINALIZE | kind::FAULT_EXPIRED)
+    !matches!(
+        kind,
+        kind::FINALIZE | kind::FAULT_EXPIRED | kind::BEGIN_HARD_FAULT_SETTLEMENT
+    )
 }
 
 /// Decodes `args` only if they are exactly the canonical ABI encoding of `T`'s parameters.
@@ -136,6 +139,7 @@ type AdmitArgs = (FixedBytes<32>, AbiBytes, Uint<64>, AbiBytes);
 type ChallengeArgs = (FixedBytes<32>, AbiBytes);
 type ClaimArgs = (AbiBytes,);
 type AdvanceTimeArgs = (Uint<64>,);
+type AccountArgs = (FixedBytes<32>,);
 
 /// Splitmix64 stream for one op, independent of every other op's choices so that replacing one
 /// op's args with concrete bytes never shifts another op's materialization.
@@ -270,7 +274,16 @@ impl World {
                 .map(|_| ())
                 .map_err(|error| status::settlement(&error)),
             kind::ADVANCE_TIME => self.advance_time(args),
-            kind::FINALIZE | kind::FAULT_EXPIRED => Err(status::MALFORMED_ARGS),
+            kind::BEGIN_HARD_FAULT_SETTLEMENT if args.is_empty() => self
+                .chain
+                .begin_hard_fault_settlement()
+                .map(|_| ())
+                .map_err(|error| status::settlement(&error)),
+            kind::CLAIM_HARD_FAULT => self.claim_hard_fault(args),
+            kind::CLAIM_PENDING_DEPOSIT => self.claim_pending_deposit(args),
+            kind::FINALIZE | kind::FAULT_EXPIRED | kind::BEGIN_HARD_FAULT_SETTLEMENT => {
+                Err(status::MALFORMED_ARGS)
+            }
             _ => Err(status::UNKNOWN_KIND),
         };
         result.err().unwrap_or(status::OK)
@@ -440,6 +453,26 @@ impl World {
         Ok(())
     }
 
+    fn claim_hard_fault(&mut self, args: &[u8]) -> Result<(), u16> {
+        let (opening,) = abi::<ClaimArgs>(args).ok_or(status::MALFORMED_ARGS)?;
+        let opening =
+            StateOpening::<Key, Digest>::decode_cfg(Copying(&opening), &MAX_OPENING_DIGESTS)
+                .map_err(|_| status::MALFORMED_ARGS)?;
+        self.chain
+            .claim_hard_fault(&opening)
+            .map(|_| ())
+            .map_err(|error| status::settlement(&error))
+    }
+
+    fn claim_pending_deposit(&mut self, args: &[u8]) -> Result<(), u16> {
+        let (account,) = abi::<AccountArgs>(args).ok_or(status::MALFORMED_ARGS)?;
+        let account: Key = crate_value(account.as_slice()).ok_or(status::MALFORMED_ARGS)?;
+        self.chain
+            .claim_pending_deposit(self.now, &account)
+            .map(|_| ())
+            .map_err(|error| status::settlement(&error))
+    }
+
     fn advance_time(&mut self, args: &[u8]) -> Result<(), u16> {
         let (delta,) = abi::<AdvanceTimeArgs>(args).ok_or(status::MALFORMED_ARGS)?;
         self.now = self.now.checked_add(delta).ok_or(status::CLOCK_OVERFLOW)?;
@@ -485,6 +518,17 @@ impl World {
             kind::ADMIT => self.make_admission(&mut pick).await,
             kind::CHALLENGE => self.make_challenge(&mut pick).await,
             kind::CLAIM_WITHDRAWAL => self.make_claim(&mut pick).await,
+            kind::CLAIM_HARD_FAULT => self.make_hard_fault_claim(&mut pick).await,
+            kind::CLAIM_PENDING_DEPOSIT => {
+                let account: [u8; 32] = self
+                    .signer(&mut pick, 20)
+                    .public_key()
+                    .encode()
+                    .as_ref()
+                    .try_into()
+                    .unwrap();
+                AccountArgs::abi_encode_params(&(account,))
+            }
             kind::ADVANCE_TIME => {
                 const DELTAS: [u64; 11] = [1, 1, 2, 5, 9, 10, 11, 20, 31, 60, 150];
                 AdvanceTimeArgs::abi_encode_params(&(DELTAS[pick.below(11) as usize],))
@@ -1033,6 +1077,19 @@ impl World {
         })
     }
 
+    /// A balance opening at the finalized (after terminal settlement starts, the frozen) root,
+    /// sometimes for an account with no balance, which falls back to another account's opening.
+    async fn make_hard_fault_claim(&self, pick: &mut Pick) -> Vec<u8> {
+        let account = self.signer(pick, 15).public_key();
+        let mut opening = self.opening(&account).await;
+        if opening.is_none() {
+            let other = &self.fixture.accounts[pick.below(4) as usize].key;
+            opening = self.opening(other).await;
+        }
+        let opening = opening.map_or_else(|| vec![0u8], |opening| opening.encode().to_vec());
+        ClaimArgs::abi_encode_params(&(opening,))
+    }
+
     async fn make_claim(&self, pick: &mut Pick) -> Vec<u8> {
         let encode = |claim: Vec<u8>| ClaimArgs::abi_encode_params(&(claim,));
         let Some(replica) = self.replica.as_ref() else {
@@ -1147,6 +1204,9 @@ impl World {
                 .invalid_from()
                 .map_or([0u8; 32], |id| id.digest().as_ref().try_into().unwrap()),
         );
+        // Terminal settlement: started (claims open, including after they drain) and settled.
+        out.push(u8::from(chain.hard_fault_settlement_started()));
+        out.push(u8::from(chain.hard_fault_is_settled()));
         Sha256::hash(&[&out]).as_ref().try_into().unwrap()
     }
 }

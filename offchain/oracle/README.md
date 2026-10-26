@@ -71,8 +71,11 @@ exact `commonware-codec` encodings and must consume every byte.
 | 6 | `claimWithdrawal` | `bytes claim` | `claim_withdrawal(neighbors, &claim)` |
 | 7 | `faultExpired` | must be empty | `fault_expired(now)` |
 | 8 | `advanceTime` | `uint64 delta` | `now += delta` (oracle clock only) |
+| 9 | `beginHardFaultSettlement` | must be empty | `begin_hard_fault_settlement()` |
+| 10 | `claimHardFault` | `bytes stateOpening` | `claim_hard_fault(&opening)` |
+| 11 | `claimPendingDeposit` | `bytes32 account` | `claim_pending_deposit(now, &account)` |
 
-Kinds 9 to 255 are unknown and report 1002. Crate decoding of the parameters:
+Kinds 12 to 255 are unknown and report 1002. Crate decoding of the parameters:
 
 - `id`: a SHA-256 digest. `account`: an ed25519 public key, which must be a valid strict key.
 - `signedWithdrawal`: `SignedWithdrawal<Ed25519, Sha256>`, destination at most 256 bytes.
@@ -118,7 +121,8 @@ The oracle plays the role of the embedding contract around `SettlementChain`:
 
 ### Materialized args
 
-For an op with empty `args` (other than `finalize` and `faultExpired`, which take none), the
+For an op with empty `args` (other than `finalize`, `faultExpired` and
+`beginHardFaultSettlement`, which take none), the
 oracle builds the args from `seed` and the op's index, independently of every other op, so
 replacing one op's args with concrete bytes never changes another op's choices. It builds real
 crate bytes against its own validator replica, which follows every close it built and that was
@@ -141,6 +145,10 @@ then admitted:
   `HigherAckDebit` evidence (as in upstream `tests/challenges.rs`), or random bytes.
 - `claimWithdrawal`: a real payout opening under the finalized payout head, sometimes with an
   inflated amount, or the never-claimable genesis Commit when there is no payout.
+- `claimHardFault`: a balance opening at the finalized root (the frozen root once terminal
+  settlement starts) for a fixture or unfunded account; an unfunded account gets another
+  account's opening, or `0x00` (undecodable) when none exists.
+- `claimPendingDeposit`: a fixture or (20%) unfunded account.
 - `advanceTime`: one of 1, 1, 2, 5, 9, 10, 11, 20, 31, 60, 150, straddling the configured
   deadlines.
 
@@ -234,8 +242,9 @@ table is `TABLE` in `src/status.rs`; a test checks that this section matches it.
 The oracle codes mean:
 
 - 1001 `MalformedArgs`: `args` are not the canonical ABI encoding the kind requires, a crate
-  value inside them does not decode, or `finalize`/`faultExpired` got non-empty args.
-- 1002 `UnknownKind`: `kind` is 9 or greater.
+  value inside them does not decode, or `finalize`, `faultExpired` or
+  `beginHardFaultSettlement` got non-empty args.
+- 1002 `UnknownKind`: `kind` is 12 or greater.
 - 1003 `ClockOverflow`: `advanceTime` would overflow the 64-bit clock; `now` is unchanged.
 - 1004 `Precondition`: the `registerEpoch` deposit-aggregate precondition above.
 
@@ -246,7 +255,7 @@ The oracle codes mean:
 
 | Field | Encoding |
 |---|---|
-| tag | the 25 ASCII bytes `BAJILLION_ORACLE_STATE_V1` |
+| tag | the 25 ASCII bytes `BAJILLION_ORACLE_STATE_V2` |
 | `now` | u64, the oracle clock |
 | `nextRegistrationEpoch` | u64, `next_registration_epoch()`, or `2^64-1` on error |
 | `nextAdmissionEpoch` | u64, `next_admission_epoch()`, or `2^64-1` on error |
@@ -271,6 +280,8 @@ The oracle codes mean:
 | fence epoch | u64, the fence epoch, else 0 |
 | invalid flag | u8: 1 if a receipt-invalidated close exists, else 0 |
 | `invalidFrom` | 32-byte batch id of the earliest invalidated close, else 32 zero bytes |
+| started flag | u8: 1 if terminal settlement has begun (`hard_fault_settlement_started`), including after it settles, else 0 |
+| settled flag | u8: 1 if terminal settlement has drained custody (`hard_fault_is_settled`), else 0 |
 
 A pending batch's status is 0 pending, 1 challenged, 2 invalidated. Its challenge kind is
 1 `HigherAckDebit`, 2 `HigherAckEntry`, 3 `AckFork` while challenged, otherwise 0. The batch id
@@ -283,17 +294,17 @@ later ops.
 
 ### Test vector
 
-The genesis state, which is the digest of an empty op list for any seed, has a 285-byte
+The genesis state, which is the digest of an empty op list for any seed, has a 287-byte
 preimage:
 
 ```
-0x42414a494c4c494f4e5f4f5241434c455f53544154455f56310000000000000000000000000000000100000000000000010000000000000001000000000000000000000000000000000000000000550b70a7c0fd428441985a82b1e8b1e9d64fb376d4d2b451f25d368fdff437d100000000000000010000000000000000550b70a7c0fd428441985a82b1e8b1e9d64fb376d4d2b451f25d368fdff437d1000000000000000100000000000000006d68250818907071bbe9eea0db384fe1d96aaa6fad1227dbd1d8875f84ae23e70000000000000000000000c8000000000000000000000000000000c8000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0x42414a494c4c494f4e5f4f5241434c455f53544154455f56320000000000000000000000000000000100000000000000010000000000000001000000000000000000000000000000000000000000550b70a7c0fd428441985a82b1e8b1e9d64fb376d4d2b451f25d368fdff437d100000000000000010000000000000000550b70a7c0fd428441985a82b1e8b1e9d64fb376d4d2b451f25d368fdff437d1000000000000000100000000000000006d68250818907071bbe9eea0db384fe1d96aaa6fad1227dbd1d8875f84ae23e70000000000000000000000c8000000000000000000000000000000c80000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 ```
 
 and digest
 
 ```
-0x5cf6f6c247c1f0f401825bf6c145f66ad6b40952e49af543850d1bc6f6b90f73
+0x0bfbe198fb3e2b7d497964cc76381a097272a777c535b3de9fa7eb53c2233ee3
 ```
 
 A test rebuilds this preimage from upstream genesis values and the layout above and checks it

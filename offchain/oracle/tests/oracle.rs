@@ -50,6 +50,11 @@ fn lifecycle() -> Vec<Op> {
         ADMIT,
         CHALLENGE,
         FAULT_EXPIRED,
+        CLAIM_PENDING_DEPOSIT,
+        BEGIN_HARD_FAULT_SETTLEMENT,
+        CLAIM_HARD_FAULT,
+        CLAIM_PENDING_DEPOSIT,
+        CLAIM_WITHDRAWAL,
     ]
     .into_iter()
     .map(op)
@@ -238,7 +243,7 @@ fn genesis_digest_follows_the_documented_layout() {
             .1
     });
     let heads = Heads::empty::<Key, Sha256>();
-    let mut preimage = b"BAJILLION_ORACLE_STATE_V1".to_vec();
+    let mut preimage = b"BAJILLION_ORACLE_STATE_V2".to_vec();
     // now, nextRegistrationEpoch, nextAdmissionEpoch, expectedEpoch, intake, pulled
     for value in [0, EPOCH, EPOCH, EPOCH, 0, 0] {
         preimage.extend_from_slice(&u64::to_be_bytes(value));
@@ -258,7 +263,8 @@ fn genesis_digest_follows_the_documented_layout() {
     preimage.extend_from_slice(&[0; 9]); // no fault, expiredAt 0
     preimage.extend_from_slice(&[0; 9]); // no fence, epoch 0
     preimage.extend_from_slice(&[0; 33]); // no invalidFrom
-    assert_eq!(preimage.len(), 285);
+    preimage.extend_from_slice(&[0; 2]); // terminal settlement neither started nor settled
+    assert_eq!(preimage.len(), 287);
     let expected: [u8; 32] = Sha256::hash(&[&preimage]).as_ref().try_into().unwrap();
     assert_eq!(run(123, Vec::new()).state_digest, expected);
 

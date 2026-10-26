@@ -41,8 +41,11 @@ pub mod kind {
     pub const CLAIM_WITHDRAWAL: u8 = 6;
     pub const FAULT_EXPIRED: u8 = 7;
     pub const ADVANCE_TIME: u8 = 8;
+    pub const BEGIN_HARD_FAULT_SETTLEMENT: u8 = 9;
+    pub const CLAIM_HARD_FAULT: u8 = 10;
+    pub const CLAIM_PENDING_DEPOSIT: u8 = 11;
     /// Number of defined kinds.
-    pub const COUNT: u8 = 9;
+    pub const COUNT: u8 = 12;
 }
 
 /// The outcome of one oracle run.
