@@ -1,0 +1,16 @@
+# Writes ../entry-receipts.json: one crate-encoded EntryReceipt per credited recipient of every
+# fixture acknowledgment, each checked with EntryReceipt::verify. Run from this directory:
+#   cargo run --release > ../entry-receipts.json
+[package]
+name = "receiptgen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+commonware-clearing = { path = "../../../../contracts/lib/commonware/clearing", features = ["std"] }
+commonware-codec = { path = "../../../../contracts/lib/commonware/codec", features = ["std"] }
+commonware-cryptography = { path = "../../../../contracts/lib/commonware/cryptography", features = ["std"] }
+commonware-cryptography-curve25519 = { path = "../../../../contracts/lib/commonware/cryptography/curve25519", features = ["std"] }
+
+[workspace]
