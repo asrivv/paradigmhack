@@ -1,0 +1,11 @@
+[package]
+name = "bajillion-upstream"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Tests that document behaviour of the pinned commonware-clearing crate worth raising upstream."
+
+[dependencies]
+commonware-clearing = { workspace = true, features = ["std"] }
+commonware-cryptography = { workspace = true, features = ["std"] }

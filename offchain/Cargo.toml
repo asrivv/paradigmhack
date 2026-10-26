@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["fixtures", "oracle"]
+members = ["fixtures", "oracle", "upstream"]
 
 [workspace.package]
 edition = "2024"
