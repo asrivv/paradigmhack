@@ -5,6 +5,7 @@
 //! records every preimage the crate hashes, the EIP-2537 point encodings, and the native store
 //! configuration ported from the upstream test helpers.
 
+pub mod deployment;
 pub mod eip2537;
 pub mod storage;
 pub mod trace;
