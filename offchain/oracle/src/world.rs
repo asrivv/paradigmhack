@@ -81,6 +81,11 @@ pub fn run(seed: u64, ops: Vec<Op>) -> Run {
             let before = world.chain.encode();
             let pruned = observes_time(op.kind).then(|| world.pruned_only());
             let status = world.apply(op.kind, &args).await;
+            // `finish_hard_fault_if_drained` (settlement.rs:2064-2082) zeroes the finalized
+            // liability, which settlement keeps private; keep the mirror in step.
+            if world.chain.hard_fault_is_settled() {
+                world.finalized_liability = 0;
+            }
             let after = world.chain.encode();
             mutated_on_error.push(
                 status != status::OK
