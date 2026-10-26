@@ -411,14 +411,21 @@ commonware-sol, and how `contracts/src/BajillionSettlement.sol` resolves them.
 | Certificates carry a 48-byte compressed G1 signature; `verifyMinSig` needs 96 uncompressed bytes | `admit` takes the crate's exact certificate bytes plus an uncompressed hint and checks the hint compresses to them (`src/verify/LibBLS12381Point.sol`). The pairing precompile then checks curve and subgroup membership |
 | Committee keys are 96-byte compressed G2; `verifyMinSig` needs EIP-2537 `G2Point`s | Same hint check at construction. Keys are not stored (8 new slots each on Tempo); `admit` takes them as calldata against a stored keccak256 |
 | commonware-sol has no proof-of-possession verifier | `src/verify/LibBLS12381PoP.sol` copies upstream hash-to-curve with the `BLS_POP_` DST. The PoP namespace is a deployment parameter |
-| Withdrawals are Ed25519-signed; the EVM has no Ed25519 precompile | `_withdrawalBoundary` accepts only the empty batch in this pass (`WithdrawalsUnsupported`). The test harness overrides it to compute the real root without the signature check, so the crate fixture epoch exercises every other production check |
+| Withdrawals are Ed25519-signed; the EVM has no Ed25519 precompile | `LibEd25519` (ZIP215) verifies each signature where upstream does: at `queueWithdrawal` intake for chain-queued requests and at registration for operator-carried extras. Admission does not re-verify; the registered withdrawal root binds the same bytes |
+| `queue_withdrawal` takes a `StateOpening`: a current ordered QMDB proof over an MMB | `StateVerifier` decodes the crate encoding into commonware-sol's `LibQMDBCurrent.Proof` and verifies it with `LibQMDBCurrentMMB`, SHA-256 at `address(2)`, 32-byte chunks, at most 256 digests |
+| `pending_withdrawal_deadlines` is an ordered set | A list sorted by `(deadline, account bytes)`; `queueWithdrawal` takes the predecessor and the contract checks it in O(1). Its head is the earliest chain-queued deadline |
+| `observe_time` prunes expired replay ids, and that pruning can be a failed call's only state change | An id is consumed while its deadline is later than `now`. The only reader is the intake check, which always follows an observation at the same `now`, so the answers match without the write. The oracle does not count a pruning-only change as mutated on error |
+| `enter_hard_fault` clears every `carried` flag | A request records its carrying epoch; it is carried only while that epoch is a live registration, which a fault ends |
+| Deposits and chain-queued withdrawals share inbox indices | Both enter the inbox hash chain. A withdrawal's entry has amount zero, which no deposit can have, so the 40-byte registration witness distinguishes them and lists the requests a pull owes |
+| The destination eligibility predicate | Eligible iff the destination is exactly 20 bytes, one Tempo address. The oracle treats every destination as eligible and materializes only 20-byte ones |
 | `SettlementChain` has no bond | The constructor escrows a bond outside custody accounting. Nothing reads it yet |
 | A revert discards the liveness fence | Once a call writes the fence it returns a `Status` and emits `HardFault` instead of reverting |
 | The embedding supplies the pulled deposit aggregate | The contract keeps a hash chain over deposits and requires the aggregate to match exactly |
 | Claimed ranges come from an authenticated ordered map | A linked list keyed by range start; the caller names the predecessor and the contract checks it in O(1) |
 | Unbounded queues of registrations and admitted closes | A 64-epoch ring; `registerEpoch` reverts with `PipelineFull` past it |
 | Clock | `block.timestamp` |
-| EIP-170: at the upstream 1,000,000 optimizer runs the contract is 29,051 bytes | `foundry.toml` compiles `BajillionSettlement.sol` alone at 200 runs (22,007 bytes). The linked verifier libraries keep 1,000,000 runs. `test/SettlementSize.t.sol` fails above 24,576 bytes |
+| EIP-170 | `foundry.toml` compiles `BajillionSettlement.sol` alone at 200 runs. Withdrawal bookkeeping (`BajillionWithdrawals`) and the claimed-range map with payout claims (`BajillionClaims`) are linked libraries whose external functions run by DELEGATECALL on a state struct in the contract's storage, so the deployment keeps one address. 22,510 bytes with withdrawals. `test/SettlementSize.t.sol` fails above 24,576 bytes |
+| Two builds of each library | Libraries imported by the settlement compile twice: canonical artifacts at 1,000,000 runs and `*.settlement.json` copies at 200 runs. Forge test linking currently picks the 200-run copies for contracts that embed the settlement (in-test Ed25519 verification costs 1,154,164 gas, against 949,348 at 1,000,000 runs), so gas snapshots understate production libraries. The deploy script deploys and links the 1,000,000-run artifacts explicitly |
 
 ### Behaviour inherited from commonware-sol
 
@@ -447,8 +454,6 @@ Skipped ops, pinned by `test_Inv10_SkipList`:
 
 | Op | Why |
 |---|---|
-| `queueWithdrawal` | Pending: chain-queued withdrawals are not ported |
-| `registerEpoch` with a nonempty withdrawal batch | Pending: production rejects it until Ed25519 withdrawal verification lands |
 | `recordDeposit` reusing a deposit id | Not applicable: the contract assigns ids, so `DuplicateDeposit` cannot occur |
 
 The deposit aggregate is one place where the contract is stricter than the crate on purpose.
