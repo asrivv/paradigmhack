@@ -150,7 +150,7 @@ abstract contract SettlementBase is Test {
     function _roots(bytes32 successor) internal view returns (bytes memory) {
         BajillionSettlement.Head memory h = settlement.head();
         uint64 epoch = settlement.admittedEnd();
-        BajillionSettlement.Epoch memory rec = settlement.epochRecord(epoch);
+        BajillionSettlement.EpochView memory rec = settlement.epochRecord(epoch);
         return abi.encodePacked(
             keccak256(abi.encode("activity", epoch)),
             h.activity.operations + 1,

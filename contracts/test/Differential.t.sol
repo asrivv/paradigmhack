@@ -5,7 +5,9 @@ import { Test } from "forge-std/Test.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { LibBLS12381 as BLS } from "commonware/certificate/LibBLS12381.sol";
 import { BajillionSettlement } from "../src/BajillionSettlement.sol";
+import { BajillionWithdrawals } from "../src/BajillionWithdrawals.sol";
 import { LibClearingCodec as Codec } from "../src/verify/LibClearingCodec.sol";
+import { WithdrawalCodec } from "../src/verify/WithdrawalVerifiers.sol";
 import { OracleStatus } from "./differential/OracleStatus.sol";
 import { StateDigest } from "./differential/StateDigest.sol";
 import { SettlementHarness } from "./harness/SettlementHarness.sol";
@@ -30,14 +32,10 @@ import { G1Decompress } from "./utils/G1Decompress.sol";
 /// Embedding witnesses the contract needs and the oracle does not take are built here from what
 /// the test has already submitted: the `pulledDeposits` list for `registerEpoch`, the
 /// registered deposit batch and the uncompressed committee and signature hints for `admit`, the
-/// target's CloseContext and RootBundle for `challenge`, and the claimed-range predecessor for
-/// `claimWithdrawal`.
+/// target's CloseContext and RootBundle for `challenge`, the claimed-range predecessor for
+/// `claimWithdrawal`, and the pending-list predecessor for `queueWithdrawal`.
 ///
-/// Ops the generator skips. PENDING: the contract does not support them yet.
-///   - queueWithdrawal (kind 1): chain-queued withdrawals are not ported.
-///   - registerEpoch with a nonempty withdrawal batch: production rejects it
-///     (`WithdrawalsUnsupported`) until Ed25519 withdrawal verification lands.
-/// NOT APPLICABLE: the embedding differs from the oracle's by design.
+/// Ops the generator skips. NOT APPLICABLE: the embedding differs from the oracle's by design.
 ///   - recordDeposit reusing an earlier deposit id: the contract assigns ids from its inbox
 ///     index, so `DuplicateDeposit` cannot occur (protocol-notes.md section 6).
 /// `test_Inv10_SkipList` pins this list.
@@ -75,7 +73,8 @@ contract DifferentialTest is Test {
     BajillionSettlement internal settlement;
     BLS.G2Point[] internal committee;
 
-    /// @dev Every accepted deposit as `account || amount`, by inbox index.
+    /// @dev Every inbox entry as `account || amount` by index: deposits with their amount,
+    /// chain-queued withdrawals with amount zero.
     bytes[] internal inbox;
     mapping(uint64 => bytes) internal registeredDeposits;
     mapping(uint64 => bytes) internal registeredWithdrawals;
@@ -114,39 +113,36 @@ contract DifferentialTest is Test {
 
     /// @notice The generator's skip list is exactly the documented one.
     function test_Inv10_SkipList() public pure {
-        string[3] memory expected = [
-            "PENDING queueWithdrawal",
-            "PENDING registerEpoch with a nonempty withdrawal batch",
-            "NOT APPLICABLE recordDeposit reusing a deposit id"
-        ];
         string[] memory skips = skipList();
-        assertEq(skips.length, expected.length, "skip list length");
-        for (uint256 i; i < expected.length; ++i) {
-            assertEq(skips[i], expected[i]);
-        }
+        assertEq(skips.length, 1, "skip list length");
+        assertEq(skips[0], "NOT APPLICABLE recordDeposit reusing a deposit id");
 
-        // The generator never emits queueWithdrawal.
+        // The generator emits every defined kind, including queueWithdrawal, and no unknown one.
+        bool[9] memory seen;
         for (uint64 seed; seed < 64; ++seed) {
             Op[] memory ops = generate(seed);
             for (uint256 i; i < ops.length; ++i) {
-                assertTrue(ops[i].kind != QUEUE_WITHDRAWAL, "generated queueWithdrawal");
                 assertTrue(ops[i].kind <= ADVANCE_TIME, "generated an unknown kind");
+                seen[ops[i].kind] = true;
             }
         }
+        for (uint256 k; k < seen.length; ++k) {
+            assertTrue(seen[k], "a kind is never generated");
+        }
 
-        // The filter drops exactly the skipped materializations.
-        Op[] memory sample = new Op[](6);
-        sample[0] = Op(REGISTER_EPOCH, abi.encode(bytes(""), uint64(0), hex"00", hex"00"));
-        sample[1] = Op(REGISTER_EPOCH, abi.encode(bytes(""), uint64(0), hex"00", hex"0100"));
-        sample[2] = Op(RECORD_DEPOSIT, abi.encode(bytes32(uint256(1)), bytes32(uint256(2)), uint64(3)));
-        sample[3] = Op(RECORD_DEPOSIT, abi.encode(bytes32(uint256(1)), bytes32(uint256(4)), uint64(5)));
-        sample[4] = Op(QUEUE_WITHDRAWAL, abi.encode(bytes(""), bytes("")));
-        sample[5] = Op(FINALIZE, "");
+        // The filter drops only a reused deposit id; withdrawal ops and batches pass through.
+        Op[] memory sample = new Op[](5);
+        sample[0] = Op(REGISTER_EPOCH, abi.encode(bytes(""), uint64(0), hex"00", hex"0100"));
+        sample[1] = Op(RECORD_DEPOSIT, abi.encode(bytes32(uint256(1)), bytes32(uint256(2)), uint64(3)));
+        sample[2] = Op(RECORD_DEPOSIT, abi.encode(bytes32(uint256(1)), bytes32(uint256(4)), uint64(5)));
+        sample[3] = Op(QUEUE_WITHDRAWAL, abi.encode(bytes(""), bytes("")));
+        sample[4] = Op(FINALIZE, "");
         Op[] memory kept = filter(sample);
-        assertEq(kept.length, 3, "kept count");
+        assertEq(kept.length, 4, "kept count");
         assertEq(kept[0].args, sample[0].args);
-        assertEq(kept[1].args, sample[2].args);
-        assertEq(kept[2].kind, FINALIZE);
+        assertEq(kept[1].args, sample[1].args);
+        assertEq(kept[2].kind, QUEUE_WITHDRAWAL);
+        assertEq(kept[3].kind, FINALIZE);
     }
 
     /// @notice Random op sequences. Fuzz runs come from the differential profile.
@@ -207,13 +203,16 @@ contract DifferentialTest is Test {
     /// (it keeps no per-deposit amounts and only panics on over-crediting, settlement.rs:1290-1308)
     /// and accepted it; the contract rejects it with `DepositAggregate`. The oracle was wrong:
     /// the embedding owes upstream the exact aggregate (settlement.rs:14-16), and it now reports
-    /// both violations as 1004. Seeds and op indices from the first 1,000-seed survey.
+    /// both violations as 1004. Seeds and op indices from the first 1,000-seed survey, replayed
+    /// with the generator and filter of that run (`_generateV1`, `_filterV1`), since the current
+    /// generator weights and skip list differ.
     function test_Differential_Inv10_Regression_InexactDepositAggregate() public {
         uint64[4] memory seeds = [uint64(28), 73, 99, 242];
         uint256[4] memory opIndex = [uint256(15), 14, 25, 25];
         for (uint256 k; k < seeds.length; ++k) {
             uint256 snapshot = vm.snapshotState();
-            (Op[] memory applied, uint16[] memory statuses) = _differential(seeds[k], generate(seeds[k]));
+            Op[] memory applied = _filterV1(filter(_materialize(seeds[k], _generateV1(seeds[k]))));
+            uint16[] memory statuses = _compare(seeds[k], applied);
             assertEq(applied[opIndex[k]].kind, REGISTER_EPOCH);
             assertEq(statuses[opIndex[k]], OracleStatus.PRECONDITION, "inexact aggregate must be rejected");
             vm.revertToState(snapshot);
@@ -258,15 +257,33 @@ contract DifferentialTest is Test {
 
     /// @notice What the generator skips, and why. Pinned by `test_Inv10_SkipList`.
     function skipList() public pure returns (string[] memory skips) {
-        skips = new string[](3);
-        skips[0] = "PENDING queueWithdrawal";
-        skips[1] = "PENDING registerEpoch with a nonempty withdrawal batch";
-        skips[2] = "NOT APPLICABLE recordDeposit reusing a deposit id";
+        skips = new string[](1);
+        skips[0] = "NOT APPLICABLE recordDeposit reusing a deposit id";
     }
 
     /// @notice Seed-chosen op kinds with empty args, for the oracle to materialize. Weights
     /// favour the lifecycle ops and time, so sequences reach admission and finalization.
     function generate(uint64 seed) public pure returns (Op[] memory ops) {
+        uint256 length = 16 + uint256(keccak256(abi.encode(seed, "length"))) % 48;
+        ops = new Op[](length);
+        for (uint256 i; i < length; ++i) {
+            uint256 r = uint256(keccak256(abi.encode(seed, i))) % 100;
+            uint8 kind;
+            if (r < 14) kind = RECORD_DEPOSIT;
+            else if (r < 22) kind = QUEUE_WITHDRAWAL;
+            else if (r < 34) kind = REGISTER_EPOCH;
+            else if (r < 48) kind = ADMIT;
+            else if (r < 56) kind = CHALLENGE;
+            else if (r < 67) kind = FINALIZE;
+            else if (r < 75) kind = CLAIM_WITHDRAWAL;
+            else if (r < 78) kind = FAULT_EXPIRED;
+            else kind = ADVANCE_TIME;
+            ops[i].kind = kind;
+        }
+    }
+
+    /// @dev The generator of the first survey (commit c626cfb): no queueWithdrawal.
+    function _generateV1(uint64 seed) internal pure returns (Op[] memory ops) {
         uint256 length = 16 + uint256(keccak256(abi.encode(seed, "length"))) % 48;
         ops = new Op[](length);
         for (uint256 i; i < length; ++i) {
@@ -284,6 +301,22 @@ contract DifferentialTest is Test {
         }
     }
 
+    /// @dev The first survey also dropped registrations carrying withdrawals.
+    function _filterV1(Op[] memory ops) internal pure returns (Op[] memory kept) {
+        kept = new Op[](ops.length);
+        uint256 n;
+        for (uint256 i; i < ops.length; ++i) {
+            if (ops[i].kind == REGISTER_EPOCH) {
+                (,,, bytes memory withdrawals) = abi.decode(ops[i].args, (bytes, uint64, bytes, bytes));
+                if (withdrawals.length != 1 || withdrawals[0] != 0x00) continue;
+            }
+            kept[n++] = ops[i];
+        }
+        assembly ("memory-safe") {
+            mstore(kept, n)
+        }
+    }
+
     /// @notice Drop the skipped ops from a materialized sequence.
     function filter(Op[] memory ops) public pure returns (Op[] memory kept) {
         kept = new Op[](ops.length);
@@ -292,11 +325,6 @@ contract DifferentialTest is Test {
         uint256 n;
         for (uint256 i; i < ops.length; ++i) {
             Op memory op = ops[i];
-            if (op.kind == QUEUE_WITHDRAWAL) continue;
-            if (op.kind == REGISTER_EPOCH) {
-                (,,, bytes memory withdrawals) = abi.decode(op.args, (bytes, uint64, bytes, bytes));
-                if (withdrawals.length != 1 || withdrawals[0] != 0x00) continue;
-            }
             if (op.kind == RECORD_DEPOSIT) {
                 (bytes32 id,,) = abi.decode(op.args, (bytes32, bytes32, uint64));
                 bool reused;
@@ -338,6 +366,13 @@ contract DifferentialTest is Test {
             assertEq(fenced, mutated[i], string.concat(where, ": mutatedOnError"));
         }
         assertEq(StateDigest.digest(settlement), expected, string.concat("seed ", vm.toString(seed), ": digest"));
+        // Invariant 5 on every run: held tokens equal active custody plus the claim reserve
+        // (the differential deployment has no bond).
+        assertEq(
+            token.balanceOf(address(settlement)),
+            uint256(settlement.custodyBalance()) + settlement.claimableBalance(),
+            "solvency"
+        );
     }
 
     function _materialize(uint64 seed, Op[] memory ops) internal returns (Op[] memory) {
@@ -403,6 +438,12 @@ contract DifferentialTest is Test {
             return s.call(abi.encodeCall(BajillionSettlement.claimWithdrawal, (_predecessor(_position(claim)), claim)));
         }
         if (op.kind == FAULT_EXPIRED) return s.call(abi.encodeCall(BajillionSettlement.faultExpired, ()));
+        if (op.kind == QUEUE_WITHDRAWAL) {
+            (bytes memory request, bytes memory opening) = abi.decode(op.args, (bytes, bytes));
+            return s.call(
+                abi.encodeCall(BajillionSettlement.queueWithdrawal, (request, opening, _pendingPredecessor(request)))
+            );
+        }
         revert("differential: op kind not generated");
     }
 
@@ -439,6 +480,9 @@ contract DifferentialTest is Test {
         if (op.kind == RECORD_DEPOSIT) {
             (, bytes32 account, uint64 amount) = abi.decode(op.args, (bytes32, bytes32, uint64));
             inbox.push(abi.encodePacked(account, amount));
+        } else if (op.kind == QUEUE_WITHDRAWAL) {
+            (bytes memory request,) = abi.decode(op.args, (bytes, bytes));
+            inbox.push(abi.encodePacked(bytes32(request), uint64(0)));
         } else if (op.kind == REGISTER_EPOCH) {
             (,, bytes memory deposits, bytes memory withdrawals) = abi.decode(op.args, (bytes, uint64, bytes, bytes));
             registeredDeposits[settlement.registeredEnd() - 1] = deposits;
@@ -503,9 +547,23 @@ contract DifferentialTest is Test {
         return Codec.readVarint(data, 0, 32);
     }
 
+    /// @dev The account after which `request` sorts by `(deadline, account)` in the contract's
+    /// pending-withdrawal list, or zero. Undecodable requests get zero; the contract rejects them.
+    function _pendingPredecessor(bytes memory request) internal view returns (bytes32 predecessor) {
+        (bool ok, WithdrawalCodec.Request memory r) = WithdrawalCodec.decodeRequest(request, 256);
+        if (!ok) return 0;
+        bytes32 cursor = settlement.pendingWithdrawalHead();
+        while (cursor != 0) {
+            BajillionWithdrawals.Pending memory p = settlement.pendingWithdrawal(cursor);
+            if (!(p.deadline < r.deadline || (p.deadline == r.deadline && cursor < r.account))) break;
+            predecessor = cursor;
+            cursor = p.next;
+        }
+    }
+
     /// @dev The start of the claimed range at or before `index`, walking the contract's list.
     function _predecessor(uint64 index) internal view returns (uint64 predecessor) {
-        uint64 cursor = settlement.claimedHead();
+        (uint64 cursor,,) = settlement.claimedRanges();
         while (cursor != 0 && cursor <= index) {
             predecessor = cursor;
             (, cursor) = settlement.claimed(cursor);

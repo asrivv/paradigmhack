@@ -57,7 +57,7 @@ abstract contract PayoutLogFixture is SettlementBase {
     /// @dev Walk the list: ranges are nonempty, sorted, disjoint, maximal (never touching), and
     /// counted correctly. Returns the number of ranges.
     function _checkRanges() internal view returns (uint256 count) {
-        uint64 cursor = settlement.claimedHead();
+        (uint64 cursor,,) = settlement.claimedRanges();
         uint64 previousEnd;
         uint64 last;
         while (cursor != 0) {
@@ -70,8 +70,9 @@ abstract contract PayoutLogFixture is SettlementBase {
             cursor = next;
             ++count;
         }
-        assertEq(count, settlement.claimedCount(), "count tracks the list");
-        if (count > 0) assertEq(settlement.claimedTail(), last, "tail is the last range");
+        (, uint64 tail, uint64 stored) = settlement.claimedRanges();
+        assertEq(count, stored, "count tracks the list");
+        if (count > 0) assertEq(tail, last, "tail is the last range");
     }
 }
 

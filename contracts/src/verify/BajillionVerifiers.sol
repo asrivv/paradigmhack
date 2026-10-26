@@ -198,6 +198,88 @@ library AdmissionVerifier {
         return (bytes4(0), uint64(successor));
     }
 
+    /// @notice `DepositBatch` decoding (boundary.rs:172-200): `varint(count) || count * (account ||
+    /// u64)`, accounts strictly increasing by bytes, amounts positive, total in u64, nothing
+    /// trailing. Returns the offset of the packed records.
+    function decodeDeposits(bytes calldata encoded)
+        public
+        pure
+        returns (bool ok, uint256 offset, uint256 count, uint64 total)
+    {
+        (uint256 n, uint256 pos, bool countOk) = Codec.readVarint(encoded, 0, 32);
+        if (!countOk || n > MAX_VECTOR_LENGTH || encoded.length - pos != n * 40) return (false, 0, 0, 0);
+        uint256 sum;
+        bytes32 previous;
+        for (uint256 i; i < n; ++i) {
+            bytes32 account = Codec.readBytes32(encoded, pos + i * 40);
+            uint64 amount = Codec.readU64(encoded, pos + i * 40 + 32);
+            if (amount == 0 || (i > 0 && account <= previous)) return (false, 0, 0, 0);
+            sum += amount;
+            previous = account;
+        }
+        if (sum > type(uint64).max) return (false, 0, 0, 0);
+        // forge-lint: disable-next-line(unsafe-typecast) bounded by the check above
+        return (true, pos, n, uint64(sum));
+    }
+
+    /// @notice Replay the inbox chain over `pulled` (40-byte `account || amount` entries from
+    /// index `start`) and check that `records` is exactly the per-account aggregate of its deposits.
+    /// A zero amount marks a chain-queued withdrawal, which is returned instead of aggregated.
+    /// @return ok False when an entry's account has no record or a record's sum differs.
+    /// @return chain The chain value after the last entry, for the caller to compare.
+    function pulledAggregate(bytes calldata records, uint256 count, bytes calldata pulled, bytes32 chain, uint64 start)
+        public
+        pure
+        returns (bool ok, bytes32, bytes32[] memory owedAccounts, uint64[] memory owedIndices)
+    {
+        uint256 entries = pulled.length / 40;
+        if (pulled.length != entries * 40) return (false, chain, owedAccounts, owedIndices);
+        uint256[] memory sums = new uint256[](count);
+        owedAccounts = new bytes32[](entries);
+        owedIndices = new uint64[](entries);
+        uint256 owed;
+        for (uint256 k; k < entries; ++k) {
+            bytes32 account = Codec.readBytes32(pulled, k * 40);
+            uint64 amount = Codec.readU64(pulled, k * 40 + 32);
+            chain = keccak256(abi.encodePacked(chain, account, amount));
+            if (amount == 0) {
+                owedAccounts[owed] = account;
+                // forge-lint: disable-next-line(unsafe-typecast) an inbox index fits in u64
+                owedIndices[owed++] = start + uint64(k);
+                continue;
+            }
+            (bool found, uint256 pos) = _findDeposit(records, count, account);
+            if (!found) return (false, chain, owedAccounts, owedIndices);
+            sums[pos] += amount;
+        }
+        for (uint256 i; i < count; ++i) {
+            if (sums[i] != Codec.readU64(records, i * 40 + 32)) return (false, chain, owedAccounts, owedIndices);
+        }
+        assembly ("memory-safe") {
+            mstore(owedAccounts, owed)
+            mstore(owedIndices, owed)
+        }
+        return (true, chain, owedAccounts, owedIndices);
+    }
+
+    /// @dev Binary search a sorted deposit batch (`DepositBatch::record_for`, boundary.rs:140-147).
+    function _findDeposit(bytes calldata records, uint256 count, bytes32 account)
+        private
+        pure
+        returns (bool found, uint256 pos)
+    {
+        uint256 lo;
+        uint256 hi = count;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) >> 1;
+            bytes32 key = Codec.readBytes32(records, mid * 40);
+            if (key == account) return (true, mid);
+            if (key < account) lo = mid + 1;
+            else hi = mid;
+        }
+        return (false, 0);
+    }
+
     /// @notice `DepositBatch::root` (boundary.rs:155-163) over `count` packed 40-byte records.
     function depositRoot(bytes calldata records, uint256 count) public pure returns (bytes32) {
         return Vector.depositRoot(records, count);

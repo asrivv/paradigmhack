@@ -56,7 +56,7 @@ contract FixtureChallengeTest is Test {
         (BajillionSettlement.Status s, BajillionSettlement.Verdict v) = _challenge("challenge_ack_fork_proven");
         assertEq(uint8(s), uint8(BajillionSettlement.Status.Ok));
         assertEq(uint8(v), uint8(BajillionSettlement.Verdict.ProvenAckFork));
-        BajillionSettlement.Epoch memory rec = settlement.epochRecord(1);
+        BajillionSettlement.EpochView memory rec = settlement.epochRecord(1);
         assertEq(rec.status, 3, "challenged");
         assertEq(rec.challengeKind, 2, "AckFork tag");
         assertEq(uint8(settlement.faultKind()), uint8(BajillionSettlement.FaultKind.ProvenChallenge));

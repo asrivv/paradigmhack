@@ -42,7 +42,7 @@ library StateDigest {
     /// `registeredEnd` to the fence, so a frontier exists exactly when `registeredEnd > admittedEnd`.
     function _frontier(S s, uint64 admitted, uint64 registered) private view returns (bytes memory) {
         if (registered <= admitted) return abi.encodePacked(uint8(0));
-        S.Epoch memory rec = s.epochRecord(admitted);
+        S.EpochView memory rec = s.epochRecord(admitted);
         return abi.encodePacked(uint8(1), admitted, rec.anchor, rec.admissionDeadline, rec.challengeDeadline);
     }
 
@@ -52,7 +52,7 @@ library StateDigest {
     function _pending(S s, uint64 expected, uint64 admitted) private view returns (bytes memory out) {
         out = abi.encodePacked(uint32(admitted - expected));
         for (uint64 e = expected; e < admitted; ++e) {
-            S.Epoch memory rec = s.epochRecord(e);
+            S.EpochView memory rec = s.epochRecord(e);
             uint8 code;
             uint8 kind;
             if (rec.status == CHALLENGED) (code, kind) = (1, rec.challengeKind + 1);
@@ -66,8 +66,8 @@ library StateDigest {
 
     /// @dev Claimed ranges in ascending start order, walked through the contract's linked list.
     function _claimed(S s) private view returns (bytes memory out) {
-        out = abi.encodePacked(uint32(s.claimedCount()));
-        uint64 cursor = s.claimedHead();
+        (uint64 cursor,, uint64 count) = s.claimedRanges();
+        out = abi.encodePacked(uint32(count));
         uint256 walked;
         while (cursor != 0) {
             (uint64 end, uint64 next) = s.claimed(cursor);
@@ -75,7 +75,7 @@ library StateDigest {
             cursor = next;
             ++walked;
         }
-        require(walked == s.claimedCount(), "digest: claimed list length");
+        require(walked == count, "digest: claimed list length");
     }
 
     /// @dev Fault reason (the contract's `FaultKind` already uses the oracle's numbering),

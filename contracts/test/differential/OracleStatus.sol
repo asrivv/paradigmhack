@@ -48,7 +48,15 @@ library OracleStatus {
         if (s == S.ZeroDeposit.selector) return 12;
         if (s == S.DepositCapacity.selector) return 15;
         if (s == S.DepositDeadlineOverflow.selector) return 16;
+        if (s == S.WithdrawalWitness.selector) return 8;
         if (s == S.IneligibleDestination.selector) return 17;
+        if (s == S.DestinationTooLarge.selector) return 18;
+        if (s == S.WithdrawalOpening.selector) return 19;
+        if (s == S.WithdrawalBalance.selector) return 20;
+        if (s == S.DuplicateWithdrawal.selector) return 21;
+        if (s == S.DuplicateWithdrawalAuthorization.selector) return 22;
+        if (s == S.WithdrawalDeadlineTooSoon.selector) return 23;
+        if (s == S.WithdrawalDeadlineTooLate.selector) return 24;
         if (s == S.WithdrawalNoticeOrder.selector) return 25;
         if (s == S.DeadlineNotReached.selector) return 26;
         if (s == S.OperatorHardFaulted.selector) return 27;
@@ -68,6 +76,9 @@ library OracleStatus {
                 || s == S.TransitionLogRange.selector || s == S.TransitionWithdrawalOutputRoot.selector
                 || s == S.TransitionLiabilityEquation.selector || s == S.TransitionLiabilityOverflow.selector
         ) return 43;
+        // SettlementError::Boundary(_) and SettlementError::State(_).
+        if (s == S.BoundaryWrongContext.selector || s == S.BoundaryInvalidSignature.selector) return 42;
+        if (s == S.StateProof.selector) return 45;
         // SettlementError::Challenge(_).
         if (
             s == S.ChallengeExpired.selector || s == S.ChallengeTooLarge.selector || s == S.ChallengeHeaderRoot.selector
@@ -83,16 +94,17 @@ library OracleStatus {
         // `Commitment(TooManyValues)`, which needs more than 2^24 records and cannot occur here.
         if (
             s == S.ContextEncoding.selector || s == S.RootsEncoding.selector || s == S.ClaimEncoding.selector
-                || s == S.DepositBatchEncoding.selector
+                || s == S.DepositBatchEncoding.selector || s == S.WithdrawalEncoding.selector
+                || s == S.StateOpeningEncoding.selector
         ) return MALFORMED_ARGS;
         // Upstream panics when a deposit batch credits an account more than its unpulled
         // deposits (settlement.rs:1304-1307); the oracle reports the panic as 1004.
         if (s == S.DepositAggregate.selector) return PRECONDITION;
         // Embedding checks: point hints, committee calldata, fixed capacities, asset transfer,
-        // and the withdrawal boundary that the generator never sends nonempty.
+        // and the pending-list position hint.
         if (
             s == S.CommitteeKeys.selector || s == S.PipelineFull.selector || s == S.InboxFull.selector
-                || s == S.TransferFailed.selector || s == S.WithdrawalsUnsupported.selector
+                || s == S.TransferFailed.selector || s == S.WithdrawalOrder.selector
         ) return EMBEDDING;
         return UNMAPPED;
     }

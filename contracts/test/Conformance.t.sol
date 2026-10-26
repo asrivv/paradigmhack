@@ -3,16 +3,15 @@ pragma solidity ^0.8.36;
 
 import { Test } from "forge-std/Test.sol";
 import { BajillionSettlement } from "../src/BajillionSettlement.sol";
+import { BajillionWithdrawals } from "../src/BajillionWithdrawals.sol";
 import { SettlementHarness } from "./harness/SettlementHarness.sol";
 import { MockTIP20 } from "./mocks/MockTIP20.sol";
 import { Fixture } from "./utils/Fixture.sol";
 
 /// @notice Invariant 9: crate fixtures (test/fixtures/, commonware-clearing at dd6d60cb) are
 /// accepted byte for byte and every invalid variant is rejected.
-/// @dev The fixture epoch carries one signed withdrawal. Production rejects nonempty withdrawal
-/// batches until Ed25519 verification lands, so the epoch runs through `SettlementHarness`, whose
-/// only change on this path is computing the withdrawal root without checking the signature.
-/// The six challenge fixtures wait for the challenge entry point (P2.2).
+/// @dev The fixture epoch carries one operator-carried signed withdrawal, verified at
+/// registration. `SettlementHarness` adds test-only entry points and changes no production path.
 contract ConformanceTest is Test {
     uint256 internal constant BOND = 1_000;
     bytes internal constant HEADER_ROOT_NAMESPACE = "_COMMONWARE_CLEARING_HEADER_ROOT";
@@ -116,16 +115,57 @@ contract ConformanceTest is Test {
         assertEq(settlement.claimableBalance(), 0);
     }
 
-    /// @dev Production refuses the fixture's signed withdrawal until Ed25519 verification lands.
-    function test_Inv09_ProductionRejectsSignedWithdrawalForNow() public {
-        BajillionSettlement production =
-            BajillionSettlement(_deploy(Fixture.deploymentArgs(address(token), BOND), false));
-        vm.warp(Fixture.uintAt(".scenario.timing.register_at"));
+    /// @dev Production verifies the fixture's crate-signed withdrawal at registration (ZIP215
+    /// Ed25519) and rejects it once one signature byte changes.
+    function test_Inv09_ProductionVerifiesSignedWithdrawal() public {
         bytes memory context = Fixture.hexFile("epoch_context");
         bytes memory deposits = Fixture.hexFile("deposit_batch");
         bytes memory withdrawals = Fixture.hexFile("withdrawal_batch");
-        vm.expectRevert(BajillionSettlement.WithdrawalsUnsupported.selector);
-        production.registerEpoch(context, 0, deposits, withdrawals, "");
+        vm.warp(Fixture.uintAt(".scenario.timing.register_at"));
+
+        BajillionSettlement production =
+            BajillionSettlement(_deploy(Fixture.deploymentArgs(address(token), BOND), false));
+        // A context that binds the tampered batch, with its anchor recomputed, so the request
+        // reaches the signature check (a mismatched root fails `BoundaryRoot` first).
+        bytes memory tampered = bytes.concat(withdrawals);
+        tampered[tampered.length - 1] ^= 0x01;
+        (bytes32 root,) = this.withdrawalRootOf(tampered);
+        bytes memory rebound = bytes.concat(context);
+        for (uint256 i; i < 32; ++i) {
+            rebound[136 + i] = root[i];
+        }
+        bytes32 anchor = sha256(
+            bytes.concat(
+                "_COMMONWARE_CLEARING_EPOCH_ANCHOR",
+                _slice(context, 72, 104),
+                _slice(context, 104, 136),
+                root,
+                _slice(context, 32, 40),
+                _slice(context, 40, 72),
+                _slice(context, 168, 264)
+            )
+        );
+        for (uint256 i; i < 32; ++i) {
+            rebound[i] = anchor[i];
+        }
+        vm.expectRevert(BajillionSettlement.BoundaryInvalidSignature.selector);
+        production.registerEpoch(rebound, 0, deposits, tampered, "");
+
+        assertEq(
+            uint8(production.registerEpoch(context, 0, deposits, withdrawals, "")), uint8(BajillionSettlement.Status.Ok)
+        );
+        assertEq(production.carriedWithdrawalDeadline(1, Fixture.bytes32At(".scenario.accounts[0].account_key")), 400);
+    }
+
+    function withdrawalRootOf(bytes calldata batch) external pure returns (bytes32, uint256) {
+        return BajillionWithdrawals.boundary(batch, 1024, 256);
+    }
+
+    function _slice(bytes memory data, uint256 start, uint256 end) internal pure returns (bytes memory out) {
+        out = new bytes(end - start);
+        for (uint256 i; i < out.length; ++i) {
+            out[i] = data[start + i];
+        }
     }
 
     // ---------------------------------------------------------------------------------------

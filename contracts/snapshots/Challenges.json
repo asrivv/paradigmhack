@@ -1,7 +1,7 @@
 {
-  "challenge_ackFork_proven": "2629100",
-  "challenge_fixture_ackFork_proven": "2647222",
-  "challenge_fixture_higherAckDebit_proven": "2348940",
-  "challenge_higherAckDebit_absent_twoNeighbours_proven": "2974371",
-  "challenge_higherAckDebit_present_proven": "2318193"
+  "challenge_ackFork_proven": "3242784",
+  "challenge_fixture_ackFork_proven": "3266732",
+  "challenge_fixture_higherAckDebit_proven": "2883506",
+  "challenge_higherAckDebit_absent_twoNeighbours_proven": "3673812",
+  "challenge_higherAckDebit_present_proven": "2842679"
 }

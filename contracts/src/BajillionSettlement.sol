@@ -3,11 +3,12 @@ pragma solidity ^0.8.36;
 
 import { LibBLS12381 as BLS } from "commonware/certificate/LibBLS12381.sol";
 import { LibCodec } from "commonware/codec/LibCodec.sol";
-import { AdmissionVerifier, CertificateVerifier, PayoutVerifier } from "./verify/BajillionVerifiers.sol";
+import { AdmissionVerifier, CertificateVerifier } from "./verify/BajillionVerifiers.sol";
 import { LibClearingCodec as Codec } from "./verify/LibClearingCodec.sol";
 import { Ed25519Verifier } from "./verify/LibEd25519.sol";
 import { BajillionChallenge } from "./BajillionChallenge.sol";
-import { LibVectorCommitment as Vector } from "./verify/LibVectorCommitment.sol";
+import { BajillionWithdrawals as Withdrawals } from "./BajillionWithdrawals.sol";
+import { BajillionClaims as Claims } from "./BajillionClaims.sol";
 
 /// @notice Minimal TIP-20 surface. TIP-20 tokens expose the ERC-20 transfer functions.
 interface ITIP20 {
@@ -22,11 +23,12 @@ interface ITIP20 {
 /// contract is an embedding of their state machine: names, preconditions and error order follow
 /// the Rust code, and every function cites the lines it ports.
 ///
-/// Implemented: constructor, `deposit` (record_deposit), `registerEpoch`, `admit`, `finalize`,
-/// `claimWithdrawal`, `faultExpired`, `challenge` (challenge_encoded, adjudicated in the linked
-/// `BajillionChallenge` library), and the liveness fence that every `now`-taking method observes
-/// first. Withdrawal batches must still be empty: verifying their Ed25519 signatures at intake is
-/// next. Chain-queued withdrawals, `HigherAckEntry` and terminal settlement come later.
+/// Implemented: constructor, `deposit` (record_deposit), `queueWithdrawal`, `registerEpoch` with
+/// chain-queued and operator-carried withdrawals, `admit`, `finalize`, `claimWithdrawal`,
+/// `faultExpired`, `challenge` (challenge_encoded, adjudicated in the linked `BajillionChallenge`
+/// library), and the liveness fence that every `now`-taking method observes first. Withdrawal
+/// signatures are ZIP215 Ed25519, checked at intake and registration exactly where upstream checks
+/// them. `HigherAckEntry` and terminal settlement come later.
 ///
 /// Clock: `now` is `block.timestamp`, which Tempo keeps non-decreasing. The crate requires one
 /// authenticated monotonic clock (settlement.rs:10) and does not fix its unit.
@@ -79,7 +81,17 @@ interface ITIP20 {
 /// | admission::Error::InvalidCommitteeSize | `InvalidCommitteeSize()` |
 /// | admission::Error::DuplicateValidator | `DuplicateValidator()` |
 /// | panic in register_epoch (deposits exceed unpulled, settlement.rs:1304-1307) | `DepositAggregate()` |
-/// | WithdrawalWitness, DuplicateWithdrawal, Withdrawal* | not reachable: `WithdrawalsUnsupported()` |
+/// | SettlementError::WithdrawalWitness | `WithdrawalWitness()` |
+/// | SettlementError::DestinationTooLarge | `DestinationTooLarge()` |
+/// | SettlementError::WithdrawalOpening | `WithdrawalOpening()` |
+/// | SettlementError::WithdrawalBalance | `WithdrawalBalance()` |
+/// | SettlementError::DuplicateWithdrawal | `DuplicateWithdrawal()` |
+/// | SettlementError::DuplicateWithdrawalAuthorization | `DuplicateWithdrawalAuthorization()` |
+/// | SettlementError::WithdrawalDeadlineTooSoon | `WithdrawalDeadlineTooSoon()` |
+/// | SettlementError::WithdrawalDeadlineTooLate | `WithdrawalDeadlineTooLate()` |
+/// | SettlementError::Boundary(WrongContext) | `BoundaryWrongContext()` |
+/// | SettlementError::Boundary(InvalidWithdrawalSignature) | `BoundaryInvalidSignature()` |
+/// | SettlementError::State(Proof) | `StateProof()` |
 /// | SettlementError::AlreadyChallenged | `AlreadyChallenged()` |
 /// | ChallengeError::Expired | `ChallengeExpired()` |
 /// | ChallengeError::TooLarge | `ChallengeTooLarge()` |
@@ -242,6 +254,10 @@ contract BajillionSettlement {
         uint64 successorLiability;
         // keccak256 of the predecessor `Heads`, compared at finalization (settlement.rs:1647-1649).
         bytes32 predecessorLogs;
+        // `earliest_withdrawal` of the registered batch (settlement.rs:431-439): its smallest
+        // `(deadline, account)`, or zero deadline when the batch is empty. Deadlines are positive.
+        uint64 withdrawalDeadline;
+        bytes32 withdrawalAccount;
     }
 
     /// @notice One run of unpulled deposits sharing an inclusion deadline (settlement.rs:280-287).
@@ -251,12 +267,18 @@ contract BajillionSettlement {
         bytes32 account;
     }
 
-    /// @notice One claimed range `[start, end)` of payout-log locations, keyed by `start`
-    /// (settlement.rs:475-490), linked to the next range by start so the contract can verify a
-    /// caller-supplied predecessor in O(1).
-    struct ClaimedRange {
-        uint64 end;
-        uint64 next;
+    /// @notice The parts of an `Epoch` that `epochRecord` returns.
+    struct EpochView {
+        bytes32 anchor;
+        bytes32 batchId;
+        uint8 status;
+        uint8 challengeKind;
+        uint64 admissionDeadline;
+        uint64 challengeDeadline;
+        uint64 withdrawalTotal;
+        uint64 successorLiability;
+        uint64 floorActivity;
+        uint64 floorPayouts;
     }
 
     /// @dev The settlement-visible prefix the next frontier binds (settlement.rs:895-907, 1749-1770).
@@ -329,7 +351,6 @@ contract BajillionSettlement {
     error RootsEncoding();
     error DepositBatchEncoding();
     error DepositAggregate();
-    error WithdrawalsUnsupported();
     error ClaimEncoding();
     error IneligibleDestination();
     error PipelineFull();
@@ -346,12 +367,29 @@ contract BajillionSettlement {
     error ChallengeActivity();
     error ChallengeInvalidPayerSignature();
     error ChallengeInvalidOperatorSignature();
+    // Withdrawal errors (settlement.rs:3159-3314, boundary.rs:619-638, qmdb.rs `Error::Proof`).
+    error WithdrawalWitness();
+    error DestinationTooLarge();
+    error WithdrawalOpening();
+    error WithdrawalBalance();
+    error DuplicateWithdrawal();
+    error DuplicateWithdrawalAuthorization();
+    error WithdrawalDeadlineTooSoon();
+    error WithdrawalDeadlineTooLate();
+    error BoundaryWrongContext();
+    error BoundaryInvalidSignature();
+    error StateProof();
+    // Embedding errors: undecodable withdrawal or opening bytes, and a wrong list position hint.
+    error WithdrawalEncoding();
+    error StateOpeningEncoding();
+    error WithdrawalOrder();
 
     // ---------------------------------------------------------------------------------------
     // Events
     // ---------------------------------------------------------------------------------------
 
     event Deposited(uint64 indexed index, bytes32 indexed account, uint64 amount);
+    event WithdrawalQueued(uint64 indexed index, bytes32 indexed account, uint64 deadline);
     event EpochRegistered(uint64 indexed epoch, bytes32 anchor, uint64 pulledEnd);
     event EpochPromoted(uint64 indexed epoch, uint64 admissionDeadline, uint64 challengeDeadline);
     event Admitted(uint64 indexed epoch, bytes32 indexed batchId, bytes32 header);
@@ -396,6 +434,8 @@ contract BajillionSettlement {
     /// @dev Encoded sizes (protocol-notes.md section 1).
     uint256 internal constant EPOCH_CONTEXT_SIZE = 264;
     uint256 internal constant ROOT_BUNDLE_SIZE = 184;
+    /// @dev Requests decoded from one withdrawal batch; the crate leaves the bound to the embedding.
+    uint256 internal constant MAX_WITHDRAWAL_RECORDS = 1024;
 
     /// @dev Capacity of the epoch ring: registered plus admitted-but-unfinalized epochs. The crate
     /// bounds neither (settlement.rs:235-239); a fixed ring keeps storage reusable.
@@ -460,18 +500,15 @@ contract BajillionSettlement {
     uint64 public pulled; // First unpulled inbox index (settlement.rs:664-665).
     uint64 public depositCount; // Lifetime deposits, bounded by `maxDepositIds`.
 
-    // Run ring indices (settlement.rs:669-671) and claimed-range list ends, packed together.
+    // Run ring indices (settlement.rs:669-671).
     uint64 public runHead;
     uint64 public runTail;
-    uint64 public claimedHead; // Start of the first claimed range, zero when empty.
-    uint64 public claimedTail; // Start of the last claimed range.
 
     // Permanent fault (settlement.rs:682-684). One slot plus one detail word.
     FaultKind public faultKind;
     uint64 public faultExpiredAt;
     uint64 public faultEpoch;
     uint64 public admissionFenceEpoch;
-    uint64 public claimedCount;
     bytes32 public faultDetail;
     /// @dev The earliest receipt-invalidated close (settlement.rs:684).
     bytes32 public invalidFrom;
@@ -487,9 +524,12 @@ contract BajillionSettlement {
     /// @dev Runs live in a ring with the same capacity as the inbox, since every run holds at
     /// least one unpulled deposit.
     mapping(uint256 => Run) internal runs;
-    /// @dev Claimed ranges. Contiguous claims merge into one record, so a fully claimed history
-    /// occupies one slot, and a merged successor is deleted (settlement.rs:1703-1709).
-    mapping(uint64 => ClaimedRange) public claimed;
+    /// @dev Claimed payout ranges, kept by the linked `BajillionClaims` library.
+    Claims.State internal claimState;
+
+    /// @dev Chain-queued withdrawals, replay ids and carried batches, kept by the linked
+    /// `BajillionWithdrawals` library (see its `State`).
+    Withdrawals.State internal withdrawalState;
 
     // ---------------------------------------------------------------------------------------
     // Constructor
@@ -599,7 +639,7 @@ contract BajillionSettlement {
     }
 
     /// @dev `observe_time` (settlement.rs:861-874). Returns true when this call wrote the fence.
-    /// Withdrawal replay pruning is a no-op until chain-queued withdrawals exist.
+    /// Replay-id pruning needs no write here: see `withdrawalReplayExpiry`.
     function _observeTime(uint64 now_) private returns (bool fenced) {
         if (faultKind != FaultKind.None) return false;
         (FaultKind kind, uint64 expiredAt, bytes32 detail, uint64 epoch) = _expiredReason(now_);
@@ -616,8 +656,7 @@ contract BajillionSettlement {
         if (!fenced && faultKind != FaultKind.None) revert OperatorHardFaulted();
     }
 
-    /// @dev `expired_reason` (settlement.rs:769-836). Chain-queued withdrawals do not exist yet,
-    /// so only deposit and registration deadlines can expire.
+    /// @dev `expired_reason` (settlement.rs:769-836).
     function _expiredReason(uint64 now_)
         private
         view
@@ -627,6 +666,18 @@ contract BajillionSettlement {
         bool depositExpired;
         Run storage front = runs[runHead % INBOX_RING];
         if (runHead < runTail && now_ >= front.deadline) depositExpired = true;
+
+        // Withdrawal attribution wins when both intake obligations expire together.
+        (uint64 wDeadline, bytes32 wAccount) = _earliestWithdrawalDeadline();
+        bool withdrawalExpired = wDeadline != 0 && now_ >= wDeadline;
+        FaultKind intakeKind;
+        uint64 intakeDeadline;
+        bytes32 intakeAccount;
+        if (withdrawalExpired && (!depositExpired || wDeadline <= front.deadline)) {
+            (intakeKind, intakeDeadline, intakeAccount) = (FaultKind.ExpiredWithdrawal, wDeadline, wAccount);
+        } else if (depositExpired) {
+            (intakeKind, intakeDeadline, intakeAccount) = (FaultKind.ExpiredDeposit, front.deadline, front.account);
+        }
 
         bool registration;
         uint64 firstExpired;
@@ -639,11 +690,25 @@ contract BajillionSettlement {
         }
 
         // At a shared first-fault instant the registration reason wins (settlement.rs:827-835).
-        if (registration && (!depositExpired || firstExpired <= front.deadline)) {
+        if (registration && (intakeKind == FaultKind.None || firstExpired <= intakeDeadline)) {
             return (FaultKind.ExpiredRegistration, frontier.admissionDeadline, frontier.anchor, admittedEnd);
         }
-        if (depositExpired) return (FaultKind.ExpiredDeposit, front.deadline, front.account, 0);
-        return (FaultKind.None, 0, bytes32(0), 0);
+        return (intakeKind, intakeDeadline, intakeAccount, 0);
+    }
+
+    /// @dev `earliest_withdrawal_deadline` (settlement.rs:756-767): the smallest
+    /// `(deadline, account)` over chain-queued requests and admitted unfinalized closes. Requests
+    /// carried only by registrations are not counted, as upstream. Zero deadline when none.
+    function _earliestWithdrawalDeadline() private view returns (uint64 deadline, bytes32 account) {
+        account = withdrawalState.head;
+        if (account != 0) deadline = withdrawalState.pending[account].deadline;
+        for (uint64 e = expectedEpoch; e < admittedEnd; ++e) {
+            Epoch storage rec = epochs[e % EPOCH_RING];
+            uint64 d = rec.withdrawalDeadline;
+            if (d != 0 && (deadline == 0 || Withdrawals._before(d, rec.withdrawalAccount, deadline, account))) {
+                (deadline, account) = (d, rec.withdrawalAccount);
+            }
+        }
     }
 
     /// @dev `enter_hard_fault` (settlement.rs:838-859): fence admission at the next admission
@@ -712,6 +777,56 @@ contract BajillionSettlement {
     }
 
     // ---------------------------------------------------------------------------------------
+    // Withdrawals
+    // ---------------------------------------------------------------------------------------
+
+    /// @notice Queue one signed withdrawal against the finalized account balance
+    /// (`queue_withdrawal`, settlement.rs:1129-1188) and return its inbox index.
+    /// @param request The crate's `SignedWithdrawal` encoding.
+    /// @param opening The crate's `StateOpening` encoding at the finalized state root.
+    /// @param predecessor The account after which the request sorts in the pending list by
+    /// `(deadline, account)`, or zero to insert at the head. The contract checks it in O(1).
+    /// @dev Both encodings are decoded before time is observed, as the crate decodes them before
+    /// the call, so undecodable bytes revert without the fence.
+    function queueWithdrawal(bytes calldata request, bytes calldata opening, bytes32 predecessor)
+        external
+        returns (Status, uint64 index)
+    {
+        (bytes32 account, uint64 deadline) = Withdrawals.decodeQueued(request, opening, maxDestinationBytes);
+        uint64 now_ = _now();
+        if (_ensureOperatingAt(now_)) return (Status.OperatorHardFaulted, 0);
+        index = intake;
+        Withdrawals.queue(
+            withdrawalState,
+            _withdrawalConfig(),
+            _window(),
+            now_,
+            currentStateRoot,
+            request,
+            opening,
+            predecessor,
+            index
+        );
+        if (index == type(uint64).max) revert IntakeOverflow();
+        if (index - pulled >= INBOX_RING - 1) revert InboxFull();
+        // A withdrawal occupies one inbox index. Its chain entry carries amount zero, which no
+        // deposit can (`ZeroDeposit`), so the registration witness tells the two apart.
+        inboxChain[(uint256(index) + 1) % INBOX_RING] =
+            keccak256(abi.encodePacked(inboxChain[index % INBOX_RING], account, uint64(0)));
+        intake = index + 1;
+        emit WithdrawalQueued(index, account, deadline);
+        return (Status.Ok, index);
+    }
+
+    function _withdrawalConfig() private view returns (Withdrawals.Config memory) {
+        return Withdrawals.Config(deployment, minimumWithdrawalNotice, maximumWithdrawalNotice, maxDestinationBytes);
+    }
+
+    function _window() private view returns (Withdrawals.Window memory) {
+        return Withdrawals.Window(expectedEpoch, admittedEnd, registeredEnd);
+    }
+
+    // ---------------------------------------------------------------------------------------
     // Registration
     // ---------------------------------------------------------------------------------------
 
@@ -719,10 +834,13 @@ contract BajillionSettlement {
     /// settlement.rs:1251-1414).
     /// @param context The crate's 264-byte `EpochContext` encoding.
     /// @param deposits The `DepositBatch` encoding: the per-account aggregate of the pulled deposits.
-    /// @param withdrawals The `WithdrawalBatch` encoding. Must be empty in this pass.
-    /// @param pulledDeposits The individual deposits at inbox indices `[pulled, end)`, packed as
-    /// `account || amount` (40 bytes each), checked against the inbox hash chain. The crate trusts
-    /// the embedding to supply the exact aggregate; this witness is how the contract checks it.
+    /// @param withdrawals The `WithdrawalBatch` encoding: every uncarried chain-queued request the
+    /// pull reaches, verbatim, plus any operator-carried extras.
+    /// @param pulledDeposits The inbox entries at indices `[pulled, end)`, packed as
+    /// `account || amount` (40 bytes each), checked against the inbox hash chain. A deposit has a
+    /// positive amount; a chain-queued withdrawal has amount zero. The crate trusts the embedding
+    /// to supply the exact deposit aggregate and the owed withdrawals; this witness is how the
+    /// contract checks both.
     function registerEpoch(
         bytes calldata context,
         uint64 end,
@@ -743,7 +861,7 @@ contract BajillionSettlement {
         if (end < pulled || end > intake) revert IntakeRange();
 
         (bytes calldata records, uint256 count, uint64 depositTotal) = _decodeDeposits(deposits);
-        (bytes32 batchWithdrawalRoot,) = _withdrawalBoundary(withdrawals);
+        (bytes32 batchWithdrawalRoot, uint256 withdrawalCount) = _withdrawalBoundary(withdrawals);
         bytes32 depositRoot = Codec.readBytes32(context, 104);
         bytes32 withdrawalRoot = Codec.readBytes32(context, 136);
         if (depositRoot != AdmissionVerifier.depositRoot(records, count) || withdrawalRoot != batchWithdrawalRoot) {
@@ -753,8 +871,24 @@ contract BajillionSettlement {
         if (Codec.readBytes32(context, 0) != _anchor(epoch, depositRoot, withdrawalRoot, limits)) {
             revert TransitionEpochAnchor();
         }
-        _checkPulledAggregate(end, records, count, pulledDeposits);
+        (bytes32[] memory owedAccounts, uint64[] memory owedIndices) =
+            _checkPulledAggregate(end, records, count, pulledDeposits);
         (uint64 admissionDeadline, uint64 challengeDeadline) = _frontierDeadlines(now_);
+        uint64 withdrawalDeadline;
+        bytes32 withdrawalAccount;
+        if (withdrawalCount != 0 || owedAccounts.length != 0) {
+            (withdrawalDeadline, withdrawalAccount) = Withdrawals.register(
+                withdrawalState,
+                _withdrawalConfig(),
+                _window(),
+                now_,
+                withdrawals,
+                MAX_WITHDRAWAL_RECORDS,
+                owedAccounts,
+                owedIndices,
+                _latestChallengeDeadline(challengeDeadline)
+            );
+        }
 
         Epoch storage rec = epochs[epoch % EPOCH_RING];
         rec.anchor = Codec.readBytes32(context, 0);
@@ -772,6 +906,8 @@ contract BajillionSettlement {
         rec.challengeDeadline = 0;
         rec.withdrawalTotal = 0;
         rec.status = REGISTERED;
+        rec.withdrawalDeadline = withdrawalDeadline;
+        rec.withdrawalAccount = withdrawalAccount;
 
         // Pulled deposits carry no inclusion deadline. A run the pull splits keeps its deadline.
         while (runHead < runTail && runs[runHead % INBOX_RING].end <= end) {
@@ -813,28 +949,30 @@ contract BajillionSettlement {
     }
 
     /// @dev Check that `records` is exactly the per-account aggregate of the deposits at
-    /// `[pulled, end)`. Replaying the inbox chain authenticates `pulledDeposits`; the aggregate
-    /// must then match record for record. Rust asserts only `<=` (settlement.rs:1290-1308) because
-    /// it cannot see individual deposits; the contract can, so it requires equality.
+    /// `[pulled, end)`, and return the chain-queued withdrawals at those indices. Replaying the
+    /// inbox chain authenticates `pulledDeposits`; the aggregate must then match record for record.
+    /// Rust asserts only `<=` (settlement.rs:1290-1308) because it cannot see individual deposits;
+    /// the contract can, so it requires equality.
     function _checkPulledAggregate(uint64 end, bytes calldata records, uint256 count, bytes calldata pulledDeposits)
         private
         view
+        returns (bytes32[] memory owedAccounts, uint64[] memory owedIndices)
     {
-        uint256 entries = end - pulled;
-        if (pulledDeposits.length != entries * 40) revert DepositAggregate();
-        bytes32 chain = inboxChain[pulled % INBOX_RING];
-        uint256[] memory sums = new uint256[](count);
-        for (uint256 k; k < entries; ++k) {
-            bytes32 account = Codec.readBytes32(pulledDeposits, k * 40);
-            uint64 amount = Codec.readU64(pulledDeposits, k * 40 + 32);
-            chain = keccak256(abi.encodePacked(chain, account, amount));
-            (bool found, uint256 pos) = _findDeposit(records, count, account);
-            if (!found) revert DepositAggregate();
-            sums[pos] += amount;
-        }
-        if (chain != inboxChain[end % INBOX_RING]) revert DepositAggregate();
-        for (uint256 i; i < count; ++i) {
-            if (sums[i] != Codec.readU64(records, i * 40 + 32)) revert DepositAggregate();
+        if (pulledDeposits.length != uint256(end - pulled) * 40) revert DepositAggregate();
+        bool ok;
+        bytes32 chain;
+        (ok, chain, owedAccounts, owedIndices) =
+            AdmissionVerifier.pulledAggregate(records, count, pulledDeposits, inboxChain[pulled % INBOX_RING], pulled);
+        if (!ok || chain != inboxChain[end % INBOX_RING]) revert DepositAggregate();
+    }
+
+    /// @dev The latest challenge deadline over the pipeline, the frontier and `challengeDeadline`.
+    function _latestChallengeDeadline(uint64 challengeDeadline) private view returns (uint64 latest) {
+        latest = challengeDeadline;
+        uint64 last = registeredEnd > admittedEnd ? admittedEnd + 1 : admittedEnd;
+        for (uint64 e = expectedEpoch; e < last; ++e) {
+            uint64 d = epochs[e % EPOCH_RING].challengeDeadline;
+            if (d > latest) latest = d;
         }
     }
 
@@ -868,7 +1006,7 @@ contract BajillionSettlement {
         _verifyCertificate(a);
 
         // `validate_close_amounts` (transition.rs:1771-1805).
-        uint64 successorLiability = _validateCloseAmounts(rec, epoch, limits, hd, roots, a);
+        (uint64 successorLiability, uint256 withdrawalCount) = _validateCloseAmounts(rec, epoch, limits, hd, roots, a);
         bool promotion = registeredEnd > epoch + 1;
         uint64 admissionDeadline;
         uint64 challengeDeadline;
@@ -879,6 +1017,11 @@ contract BajillionSettlement {
         (bytes calldata records, uint256 count,) = _decodeDeposits(a.deposits);
         for (uint256 i; i < count; ++i) {
             pendingDeposits[Codec.readBytes32(records, i * 40)] -= Codec.readU64(records, i * 40 + 32);
+        }
+        // The admitted batch retires the chain-queued requests it carries and consumes every
+        // request's replay id until its deadline (settlement.rs:1504-1522).
+        if (withdrawalCount != 0) {
+            Withdrawals.retire(withdrawalState, a.withdrawals, MAX_WITHDRAWAL_RECORDS, maxDestinationBytes);
         }
         rec.withdrawalTotal = a.withdrawalTotal;
         rec.status = PENDING;
@@ -921,12 +1064,13 @@ contract BajillionSettlement {
         Head memory hd,
         Roots memory roots,
         Admission calldata a
-    ) private view returns (uint64) {
+    ) private view returns (uint64, uint256 withdrawalCount) {
         if (rec.anchor != _anchor(epoch, rec.depositRoot, rec.withdrawalRoot, limits)) {
             revert TransitionEpochAnchor();
         }
         (bytes calldata records, uint256 count, uint64 depositTotal) = _decodeDeposits(a.deposits);
-        (bytes32 withdrawalRoot, uint256 withdrawalCount) = _withdrawalBoundary(a.withdrawals);
+        bytes32 withdrawalRoot;
+        (withdrawalRoot, withdrawalCount) = _withdrawalBoundary(a.withdrawals);
         if (AdmissionVerifier.depositRoot(records, count) != rec.depositRoot || withdrawalRoot != rec.withdrawalRoot) {
             revert TransitionBoundaryRoot();
         }
@@ -955,7 +1099,7 @@ contract BajillionSettlement {
             })
         );
         if (err != bytes4(0)) _revertWith(err);
-        return successorLiability;
+        return (successorLiability, withdrawalCount);
     }
 
     /// @dev Revert with a bare custom-error selector returned by a linked library.
@@ -995,12 +1139,6 @@ contract BajillionSettlement {
             uint256(claimableBalance) + withdrawalTotal > type(uint64).max || custodyBalance < withdrawalTotal
                 || unfinalizedDepositTotal < rec.depositTotal
         ) return _reject(fenced, Status.CustodyArithmetic);
-        uint64 tail = claimedTail;
-        (bool ok, uint64 rangeStart, uint64 rangeEnd,, ClaimedRange memory succ, uint64 afterStart) =
-            _planClaim(commitIndex, tail);
-        // Unreachable: every claimed range ends at or below the old payout count, which is at most
-        // `commitIndex`, so the commit location always extends the last range.
-        if (!ok) return _reject(fenced, Status.StateAncestry);
 
         currentStateRoot = rec.successorRoot;
         currentLiability = rec.successorLiability;
@@ -1012,7 +1150,9 @@ contract BajillionSettlement {
         finalizedRowsStart = rec.rowsStart;
         finalizedRowsEnd = rec.rowsEnd;
         expectedEpoch = epoch + 1;
-        _applyClaim(commitIndex, tail, afterStart, rangeStart, rangeEnd, succ);
+        // Every claimed range ends at or below the old payout count, which is at most
+        // `commitIndex`, so the commit always extends the last range and this cannot fail.
+        if (!Claims.insertCommit(claimState, commitIndex)) revert StateAncestry();
         emit Finalized(epoch, rec.batchId, rec.successorRoot, withdrawalTotal, custodyBalance, commitIndex);
         return Status.Ok;
     }
@@ -1109,170 +1249,41 @@ contract BajillionSettlement {
         external
         returns (uint64 rangeStart, uint64 rangeEnd)
     {
-        (uint256 outputEnd, uint64 amount, uint64 index, uint256 leaves, uint256 inactivePeaks, uint256 digestsAt) =
-            _decodeClaim(claim);
-
-        // ClaimedRange::insert and the neighbour bounds (settlement.rs:1716-1724).
         LogHead memory hd = finalizedPayouts;
-        bool ok;
-        ClaimedRange memory prior;
-        ClaimedRange memory succ;
-        uint64 afterStart;
-        (ok, rangeStart, rangeEnd, prior, succ, afterStart) = _planClaim(index, predecessor);
-        if (!ok || prior.end > hd.operations || succ.end > hd.operations || rangeEnd > hd.operations) {
-            revert ClaimUnavailable();
-        }
-
-        // `WithdrawalClaim::verify` -> `Opening::verify_payout` (transition.rs:1014-1021,
-        // logs.rs:399-433). LibQMDBKeylessMMR.verify wraps LibQMDBCommon.verify with the MMR
-        // family; its `Proof calldata` struct cannot point into the crate encoding, so the
-        // contract calls the wrapped function directly.
-        if (
-            uint256(index) + 1 > uint256(hd.operations) - 1 || leaves != hd.operations
-                || inactivePeaks != _inactivePeaks(hd.operations, hd.floor)
-                || !PayoutVerifier.verifyPayout(hd.root, claim, outputEnd, index, leaves, inactivePeaks, digestsAt)
-        ) revert ClaimProof();
-        if (claimableBalance < amount) revert ClaimReserve();
-        address destination = _destination(claim);
-
+        (uint64 index, uint64 amount, address destination, uint64 start, uint64 end) = Claims.claim(
+            claimState,
+            Claims.Head(hd.root, hd.operations, hd.floor),
+            claimableBalance,
+            predecessor,
+            claim,
+            maxDestinationBytes
+        );
         claimableBalance -= amount;
-        _applyClaim(index, predecessor, afterStart, rangeStart, rangeEnd, succ);
-        emit WithdrawalClaimed(index, destination, amount, rangeStart, rangeEnd);
+        emit WithdrawalClaimed(index, destination, amount, start, end);
         if (amount != 0 && !ITIP20(asset).transfer(destination, amount)) revert TransferFailed();
-    }
-
-    /// @dev Resolve the neighbours of `index` from the ordered list and run `ClaimedRange::insert`
-    /// (settlement.rs:501-521) on them. A neighbour with `end == 0` is absent.
-    function _planClaim(uint64 index, uint64 predecessor)
-        internal
-        view
-        returns (
-            bool ok,
-            uint64 start,
-            uint64 end,
-            ClaimedRange memory prior,
-            ClaimedRange memory succ,
-            uint64 afterStart
-        )
-    {
-        uint64 beforeStart;
-        if (predecessor == 0) {
-            afterStart = claimedHead;
-            if (afterStart != 0 && afterStart <= index) return (false, 0, 0, prior, succ, 0);
-        } else {
-            prior = claimed[predecessor];
-            if (prior.end == 0 || predecessor > index) return (false, 0, 0, prior, succ, 0);
-            afterStart = prior.next;
-            if (afterStart != 0 && afterStart <= index) return (false, 0, 0, prior, succ, 0);
-            beforeStart = predecessor;
-        }
-        if (afterStart != 0) succ = claimed[afterStart];
-
-        // ClaimedRange::insert. Stored ranges are valid by construction, so `is_valid` reduces to
-        // the coverage checks.
-        if (index == 0 || index >= MMR_MAX_LEAVES) return (false, 0, 0, prior, succ, afterStart);
-        if (beforeStart != 0 && prior.end > index) return (false, 0, 0, prior, succ, afterStart);
-        uint64 next = index + 1;
-        start = beforeStart != 0 && prior.end == index ? beforeStart : index;
-        end = afterStart != 0 && afterStart == next ? succ.end : next;
-        return (true, start, end, prior, succ, afterStart);
-    }
-
-    /// @dev Upsert the merged range and delete a merged successor, keeping the list linked.
-    /// `predecessor` and `afterStart` are the neighbours `_planClaim` resolved (zero when absent).
-    function _applyClaim(
-        uint64 index,
-        uint64 predecessor,
-        uint64 afterStart,
-        uint64 start,
-        uint64 end,
-        ClaimedRange memory succ
-    ) internal {
-        bool mergeAfter = afterStart != 0 && afterStart == index + 1;
-        uint64 next = mergeAfter ? succ.next : afterStart;
-        if (predecessor != 0 && start == predecessor) {
-            claimed[predecessor] = ClaimedRange(end, next);
-        } else {
-            claimed[start] = ClaimedRange(end, next);
-            ++claimedCount;
-            if (predecessor == 0) claimedHead = start;
-            else claimed[predecessor].next = start;
-        }
-        if (mergeAfter) {
-            delete claimed[afterStart];
-            --claimedCount;
-        }
-        if (next == 0) claimedTail = start;
-    }
-
-    /// @dev `mmr::Family::inactive_peaks` (storage/src/merkle/mod.rs:101-116): the number of
-    /// leading peaks, largest first, whose cumulative leaf capacity stays at or below the floor.
-    function _inactivePeaks(uint64 leaves, uint64 floor) private pure returns (uint256 count) {
-        uint256 sum;
-        for (uint256 i; i < 64; ++i) {
-            uint256 capacity = uint256(1) << (63 - i);
-            if (leaves & capacity == 0) continue;
-            sum += capacity;
-            if (sum > floor) break;
-            ++count;
-        }
+        return (start, end);
     }
 
     // ---------------------------------------------------------------------------------------
     // Encoding
     // ---------------------------------------------------------------------------------------
 
-    /// @dev `DepositBatch` decoding (boundary.rs:172-200): `varint(count) || count * (account || u64)`,
-    /// accounts strictly increasing by bytes, amounts positive, total in u64, nothing trailing.
+    /// @dev `DepositBatch` decoding, in `AdmissionVerifier.decodeDeposits`.
     function _decodeDeposits(bytes calldata encoded)
         private
         pure
         returns (bytes calldata records, uint256 count, uint64 total)
     {
-        (uint256 n, uint256 pos, bool ok) = Codec.readVarint(encoded, 0, 32);
-        if (!ok || n > MAX_VECTOR_LENGTH || encoded.length - pos != n * 40) revert DepositBatchEncoding();
-        records = encoded[pos:];
-        count = n;
-        uint256 sum;
-        bytes32 previous;
-        for (uint256 i; i < n; ++i) {
-            bytes32 account = Codec.readBytes32(records, i * 40);
-            uint64 amount = Codec.readU64(records, i * 40 + 32);
-            if (amount == 0 || (i > 0 && account <= previous)) revert DepositBatchEncoding();
-            sum += amount;
-            previous = account;
-        }
-        if (sum > type(uint64).max) revert DepositBatchEncoding();
-        // forge-lint: disable-next-line(unsafe-typecast) bounded by the checks above
-        total = uint64(sum);
+        (bool ok, uint256 offset, uint256 n, uint64 sum) = AdmissionVerifier.decodeDeposits(encoded);
+        if (!ok) revert DepositBatchEncoding();
+        return (encoded[offset:], n, sum);
     }
 
-    /// @dev Binary search a sorted deposit batch (`DepositBatch::record_for`, boundary.rs:140-147).
-    function _findDeposit(bytes calldata records, uint256 count, bytes32 account)
-        private
-        pure
-        returns (bool found, uint256 pos)
-    {
-        uint256 lo;
-        uint256 hi = count;
-        while (lo < hi) {
-            uint256 mid = (lo + hi) >> 1;
-            bytes32 key = Codec.readBytes32(records, mid * 40);
-            if (key == account) return (true, mid);
-            if (key < account) lo = mid + 1;
-            else hi = mid;
-        }
-        return (false, 0);
-    }
-
-    /// @dev The withdrawal boundary's vector root and request count. Every signed withdrawal
-    /// carries an Ed25519 signature that settlement must verify (boundary.rs:454-472), and the EVM
-    /// has no Ed25519 precompile, so this pass accepts only the empty batch: one varint zero byte.
-    /// Ed25519 withdrawal verification is the next step; the test harness overrides this hook to
-    /// run crate fixtures that carry a withdrawal through the remaining production checks.
-    function _withdrawalBoundary(bytes calldata encoded) internal view virtual returns (bytes32 root, uint256 count) {
-        if (encoded.length != 1 || encoded[0] != 0x00) revert WithdrawalsUnsupported();
-        return (Vector.emptyWithdrawalRoot(), 0);
+    /// @dev Decode a `WithdrawalBatch` and compute its vector root. Signatures are checked where
+    /// upstream checks them: at intake for chain-queued requests and at registration for extras.
+    /// Admission binds the same bytes through the registered root.
+    function _withdrawalBoundary(bytes calldata encoded) private view returns (bytes32 root, uint256 count) {
+        return Withdrawals.boundary(encoded, MAX_WITHDRAWAL_RECORDS, maxDestinationBytes);
     }
 
     /// @dev `RootBundle` decoding (transition.rs:285-298) with `LogHead::try_new` checks
@@ -1290,32 +1301,6 @@ contract BajillionSettlement {
 
     function _validHead(LogHead memory h) private pure returns (bool) {
         return h.operations != 0 && h.operations <= MMR_MAX_LEAVES && h.floor < h.operations;
-    }
-
-    /// @dev `WithdrawalClaim` decoding, in `PayoutVerifier.decodeClaim`.
-    function _decodeClaim(bytes calldata claim)
-        private
-        view
-        returns (
-            uint256 outputEnd,
-            uint64 amount,
-            uint64 index,
-            uint256 leaves,
-            uint256 inactivePeaks,
-            uint256 digestsAt
-        )
-    {
-        bool ok;
-        (ok, outputEnd, amount, index, leaves, inactivePeaks, digestsAt) =
-            PayoutVerifier.decodeClaim(claim, maxDestinationBytes);
-        if (!ok) revert ClaimEncoding();
-    }
-
-    /// @dev The asset adapter's destination: exactly one 20-byte Tempo address.
-    function _destination(bytes calldata claim) private pure returns (address destination) {
-        (uint256 length, uint256 pos,) = Codec.readVarint(claim, 0, 32);
-        if (length != 20) revert IneligibleDestination();
-        destination = address(bytes20(claim[pos:pos + 20]));
     }
 
     /// @dev Epoch anchor (transition.rs:533-544).
@@ -1423,10 +1408,35 @@ contract BajillionSettlement {
     // Views
     // ---------------------------------------------------------------------------------------
 
-    /// @notice The stored record for `epoch`, if it is still in the ring.
-    function epochRecord(uint64 epoch) external view returns (Epoch memory rec) {
-        rec = epochs[epoch % EPOCH_RING];
-        if (rec.epoch != epoch || rec.status == 0) delete rec;
+    /// @notice The fields of a stored epoch that callers read, if it is still in the ring. All zero
+    /// when the epoch is not registered.
+    function epochRecord(uint64 epoch) external view returns (EpochView memory v) {
+        Epoch storage rec = epochs[epoch % EPOCH_RING];
+        if (rec.epoch != epoch || rec.status == 0) return v;
+        v = EpochView(
+            rec.anchor,
+            rec.batchId,
+            rec.status,
+            rec.challengeKind,
+            rec.admissionDeadline,
+            rec.challengeDeadline,
+            rec.withdrawalTotal,
+            rec.successorLiability,
+            rec.floorActivity,
+            rec.floorPayouts
+        );
+    }
+
+    /// @notice The claimed range starting at `start`: its exclusive end (zero when absent) and the
+    /// start of the next range.
+    function claimed(uint64 start) external view returns (uint64 end, uint64 next) {
+        Claims.Range storage r = claimState.ranges[start];
+        return (r.end, r.next);
+    }
+
+    /// @notice First and last claimed range starts (zero when empty) and the number of ranges.
+    function claimedRanges() external view returns (uint64 first, uint64 last, uint64 count) {
+        return (claimState.head, claimState.tail, claimState.count);
     }
 
     /// @notice The admitted head the next frontier binds as its predecessor.
@@ -1439,6 +1449,31 @@ contract BajillionSettlement {
         if (registeredEnd <= admittedEnd) revert NoRegisteredEpoch();
         Epoch storage rec = epochs[admittedEnd % EPOCH_RING];
         return _closeContext(rec, admittedEnd, _limits(rec), _head());
+    }
+
+    /// @notice An account's chain-queued withdrawal, if any (`deadline` zero when none).
+    function pendingWithdrawal(bytes32 account) external view returns (Withdrawals.Pending memory) {
+        return withdrawalState.pending[account];
+    }
+
+    /// @notice The account whose chain-queued withdrawal has the smallest `(deadline, account)`.
+    function pendingWithdrawalHead() external view returns (bytes32) {
+        return withdrawalState.head;
+    }
+
+    /// @notice `unfinalized_withdrawal_deadline` (settlement.rs:1061-1088), zero when none.
+    function unfinalizedWithdrawalDeadline(bytes32 account) external view returns (uint64) {
+        return Withdrawals.unfinalizedDeadline(withdrawalState, _window(), account);
+    }
+
+    /// @notice The deadline of `account`'s request in `epoch`'s registered batch, or zero.
+    function carriedWithdrawalDeadline(uint64 epoch, bytes32 account) external view returns (uint64) {
+        return withdrawalState.carried[epoch][account];
+    }
+
+    /// @notice The deadline until which a withdrawal id stays consumed.
+    function withdrawalReplayExpiry(bytes32 id) external view returns (uint64) {
+        return withdrawalState.replayExpiry[id];
     }
 
     /// @notice The inbox chain value committing every deposit before `index`, while retained.
