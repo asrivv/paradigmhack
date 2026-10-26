@@ -12,7 +12,13 @@ optimizer_runs = 1000000
 via_ir = true
 # As upstream sol/foundry.toml: differential tests need FFI and run only in their own profile.
 no_match_test = "test(Fuzz)?_Differential"
-fs_permissions = [{ access = "read", path = "./test/fixtures" }, { access = "read", path = "./test/vectors" }]
+fs_permissions = [
+    { access = "read", path = "./test/fixtures" },
+    { access = "read", path = "./test/vectors" },
+    # Deployment scripts link library artifacts by hand and record the deployment.
+    { access = "read", path = "./out" },
+    { access = "read-write", path = "../deployments" },
+]
 remappings = [
     "commonware/=lib/commonware/sol/src/",
     "forge-std/=lib/forge-std/src/",
@@ -42,6 +48,9 @@ no_match_test = "test_unused"
 
 [profile.differential.fuzz]
 runs = 1000
+
+[rpc_endpoints]
+moderato = "https://rpc.moderato.tempo.xyz"
 
 [fmt]
 bracket_spacing = true

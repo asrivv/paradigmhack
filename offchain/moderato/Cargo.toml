@@ -1,0 +1,19 @@
+[package]
+name = "bajillion-moderato"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Builds the fixture epoch for a live deployment's clock, as the operator would."
+
+[dependencies]
+bajillion-fixtures = { path = "../fixtures" }
+bytes.workspace = true
+commonware-clearing = { workspace = true, features = ["std"] }
+commonware-codec = { workspace = true, features = ["std"] }
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography-curve25519 = { workspace = true, features = ["std"] }
+commonware-parallel = { workspace = true, features = ["std"] }
+commonware-runtime.workspace = true
+commonware-utils = { workspace = true, features = ["std"] }
+serde_json.workspace = true

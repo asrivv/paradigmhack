@@ -600,6 +600,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bajillion-moderato"
+version = "0.1.0"
+dependencies = [
+ "bajillion-fixtures",
+ "bytes",
+ "commonware-clearing",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-cryptography-curve25519",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-utils",
+ "serde_json",
+]
+
+[[package]]
 name = "bajillion-oracle"
 version = "0.1.0"
 dependencies = [
