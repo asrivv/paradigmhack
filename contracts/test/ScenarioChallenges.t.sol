@@ -2,6 +2,7 @@
 pragma solidity ^0.8.36;
 
 import { BajillionSettlement } from "../src/BajillionSettlement.sol";
+import { Head } from "../src/BajillionTypes.sol";
 import { SettlementBase } from "./SettlementBase.sol";
 import { ScenarioEd25519 } from "./utils/ScenarioEd25519.sol";
 import { ScenarioMMR } from "./utils/ScenarioMMR.sol";
@@ -193,7 +194,7 @@ contract ScenarioHigherAckDebitTest is ScenarioChallengeBase {
         }
         activity.push(hex"000000");
         _register(0);
-        BajillionSettlement.Head memory h = settlement.head();
+        Head memory h = settlement.head();
         bytes[] memory ops = activity;
         bytes memory roots = abi.encodePacked(
             _activityRoot(ops),

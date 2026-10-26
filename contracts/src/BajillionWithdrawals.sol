@@ -4,6 +4,8 @@ pragma solidity ^0.8.36;
 import { LibQMDBCurrent } from "commonware/qmdb/LibQMDBCurrent.sol";
 import { Ed25519Verifier } from "./verify/LibEd25519.sol";
 import { StateVerifier, WithdrawalCodec as W } from "./verify/WithdrawalVerifiers.sol";
+import { LibClearingCodec as Codec } from "./verify/LibClearingCodec.sol";
+import { EPOCH_RING_SIZE, Epoch } from "./BajillionTypes.sol";
 
 /// @title Withdrawal bookkeeping for BajillionSettlement
 /// @notice A linked library holding the withdrawal half of `SettlementChain`
@@ -40,9 +42,11 @@ library BajillionWithdrawals {
         /// reader is the intake check, which always runs after an observation at the same `now`.
         /// So "consumed while `deadline > now`" is the same predicate without the pruning writes.
         mapping(bytes32 => uint64) replayExpiry;
-        /// The deadline of an account's request in an epoch's registered batch, or zero. Epoch
-        /// numbers are never registered twice, so entries need no clearing.
-        mapping(uint64 => mapping(bytes32 => uint64)) carried;
+        /// An account's request in an epoch's registered batch, or zero: the high 192 bits of
+        /// the request's keccak256 digest above its u64 deadline (see `carriedRecord`). Terminal
+        /// claims match a supplied request against the digest. Epoch numbers are never
+        /// registered twice, so entries need no clearing.
+        mapping(uint64 => mapping(bytes32 => bytes32)) carried;
     }
 
     /// @notice Deployment parameters the intake battery reads.
@@ -152,9 +156,9 @@ library BajillionWithdrawals {
     /// record the batch for `carried_withdrawal_deadline`, mark the chain-queued requests it
     /// carries verbatim (`mark_carried`, settlement.rs:441-458), drop the requests its extras
     /// supersede, and return `earliest_withdrawal` (settlement.rs:431-439), zero when empty.
-    /// @param owedAccounts The chain-queued withdrawals at the pulled indices `owedIndices`, from
-    /// the authenticated inbox witness. While operating, uncarried requests sit at or past
-    /// `pulled`, so these are every request the pull reaches.
+    /// @param pulled The authenticated inbox witness for indices from `pulledStart`: 40-byte
+    /// `account || amount` entries, amount zero for a chain-queued withdrawal. While operating,
+    /// uncarried requests sit at or past `pulled`, so these are every request the pull reaches.
     /// @param latestChallengeDeadline The latest challenge deadline over the pipeline, the
     /// frontier, and the deadline this epoch would receive now.
     function register(
@@ -164,15 +168,17 @@ library BajillionWithdrawals {
         uint64 now_,
         bytes calldata encoded,
         uint256 maxRecords,
-        bytes32[] memory owedAccounts,
-        uint64[] memory owedIndices,
+        bytes calldata pulled,
+        uint64 pulledStart,
         uint64 latestChallengeDeadline
     ) external returns (uint64 earliest, bytes32 earliestAccount) {
         W.Request[] memory requests = _decodeBatch(encoded, maxRecords, c.maxDestinationBytes);
-        for (uint256 k; k < owedAccounts.length; ++k) {
-            Pending storage p = s.pending[owedAccounts[k]];
-            if (p.deadline == 0 || p.index != owedIndices[k] || _isCarried(p, w)) continue;
-            if (!_batchHas(requests, owedAccounts[k], p.digest)) revert WithdrawalWitness();
+        for (uint256 k; k < pulled.length / 40; ++k) {
+            if (Codec.readU64(pulled, k * 40 + 32) != 0) continue;
+            bytes32 owed = Codec.readBytes32(pulled, k * 40);
+            Pending storage p = s.pending[owed];
+            if (p.deadline == 0 || p.index != pulledStart + k || _isCarried(p, w)) continue;
+            if (!_batchHas(requests, owed, p.digest)) revert WithdrawalWitness();
         }
         bytes32[] memory superseded = new bytes32[](requests.length);
         uint256 n;
@@ -199,7 +205,7 @@ library BajillionWithdrawals {
         uint64 epoch = w.registeredEnd;
         for (uint256 i; i < requests.length; ++i) {
             W.Request memory r = requests[i];
-            s.carried[epoch][r.account] = r.deadline;
+            s.carried[epoch][r.account] = carriedRecord(r.digest, r.deadline);
             Pending storage p = s.pending[r.account];
             if (p.deadline != 0 && p.digest == r.digest) p.carriedBy = epoch + 1;
             if (earliest == 0 || _before(r.deadline, r.account, earliest, earliestAccount)) {
@@ -227,6 +233,27 @@ library BajillionWithdrawals {
     // Views
     // ---------------------------------------------------------------------------------------
 
+    /// @notice `earliest_withdrawal_deadline` (settlement.rs:756-767): the smallest
+    /// `(deadline, account)` over chain-queued requests and the admitted unfinalized closes
+    /// `[expectedEpoch, admittedEnd)`. Requests carried only by registrations are not counted, as
+    /// upstream. Zero deadline when none.
+    function earliestDeadline(
+        State storage s,
+        mapping(uint256 => Epoch) storage epochs,
+        uint64 expectedEpoch,
+        uint64 admittedEnd
+    ) external view returns (uint64 deadline, bytes32 account) {
+        account = s.head;
+        if (account != 0) deadline = s.pending[account].deadline;
+        for (uint64 e = expectedEpoch; e < admittedEnd; ++e) {
+            Epoch storage rec = epochs[e % EPOCH_RING_SIZE];
+            uint64 d = rec.withdrawalDeadline;
+            if (d != 0 && (deadline == 0 || _before(d, rec.withdrawalAccount, deadline, account))) {
+                (deadline, account) = (d, rec.withdrawalAccount);
+            }
+        }
+    }
+
     /// @notice `unfinalized_withdrawal_deadline` (settlement.rs:1061-1088): the account's
     /// chain-queued request, else one a live registration or an admitted unfinalized close
     /// carries, in that order. Zero when none.
@@ -235,11 +262,11 @@ library BajillionWithdrawals {
         if (d != 0) return d;
         // Upstream checks the frontier, then queued registrations, then the pipeline.
         for (uint64 e = w.admittedEnd; e < w.registeredEnd; ++e) {
-            d = s.carried[e][account];
+            d = uint64(uint256(s.carried[e][account]));
             if (d != 0) return d;
         }
         for (uint64 e = w.expectedEpoch; e < w.admittedEnd; ++e) {
-            d = s.carried[e][account];
+            d = uint64(uint256(s.carried[e][account]));
             if (d != 0) return d;
         }
         return 0;
@@ -334,6 +361,12 @@ library BajillionWithdrawals {
         else s.pending[prev].next = next;
         if (next != 0) s.pending[next].prev = prev;
         delete s.pending[account];
+    }
+
+    /// @notice The packed `carried` entry for a request: digest high bits, then the deadline. Never
+    /// zero, since deadlines are positive.
+    function carriedRecord(bytes32 digest, uint64 deadline) internal pure returns (bytes32) {
+        return bytes32((uint256(digest) >> 64 << 64) | deadline);
     }
 
     /// @dev `(deadline, account)` order: deadline first, then account bytes, the derived order of

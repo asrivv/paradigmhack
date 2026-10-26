@@ -9,6 +9,20 @@ import { Ed25519Verifier } from "./verify/LibEd25519.sol";
 import { BajillionChallenge } from "./BajillionChallenge.sol";
 import { BajillionWithdrawals as Withdrawals } from "./BajillionWithdrawals.sol";
 import { BajillionClaims as Claims } from "./BajillionClaims.sol";
+import { BajillionRecovery as Recovery } from "./BajillionRecovery.sol";
+import {
+    BATCH_CHALLENGED,
+    BATCH_INVALIDATED,
+    BATCH_PENDING,
+    BATCH_REGISTERED,
+    EPOCH_RING_SIZE,
+    Epoch,
+    Head,
+    INBOX_RING_SIZE,
+    LogHead,
+    Run
+} from "./BajillionTypes.sol";
+import { BajillionLiveness as Liveness } from "./BajillionLiveness.sol";
 
 /// @notice Minimal TIP-20 surface. TIP-20 tokens expose the ERC-20 transfer functions.
 interface ITIP20 {
@@ -209,64 +223,6 @@ contract BajillionSettlement {
         bytes withdrawals;
     }
 
-    /// @notice `LogHead` (logs.rs:168-176). Two slots.
-    struct LogHead {
-        bytes32 root;
-        uint64 operations;
-        uint64 floor;
-    }
-
-    /// @notice One registered or admitted epoch.
-    /// @dev Epochs live in a ring of `EPOCH_RING` records keyed by `epoch % EPOCH_RING`. Tempo
-    /// charges 250,000 gas for each storage slot that goes from zero to nonzero, so a record that
-    /// is overwritten in place costs about 3,000 per slot after the ring's first lap. Records are
-    /// never cleared, for the same reason; `status` and the deadlines are rewritten on reuse.
-    /// Fields are packed so that each slot is written by one step of the lifecycle.
-    struct Epoch {
-        // Registration (EpochContext, transition.rs:492-499). The deployment, operator and
-        // committee are immutable per deployment and are not stored per epoch.
-        bytes32 anchor;
-        bytes32 depositRoot;
-        bytes32 withdrawalRoot;
-        uint64[8] limits; // CloseLimits (transition.rs:356-365), two slots.
-        uint64 epoch; // Guards against reading a stale ring record.
-        uint64 floorActivity; // Floors captured pos registration (settlement.rs:1776-1781).
-        uint64 floorPayouts;
-        uint64 depositTotal;
-        // Promotion (settlement.rs:1418-1440). Zero admission deadline means not yet promoted;
-        // a promoted deadline is at least `admissionDelay > 0`.
-        uint64 admissionDeadline;
-        uint64 challengeDeadline;
-        // Admission (settlement.rs:1523-1540).
-        uint64 withdrawalTotal;
-        uint8 status;
-        uint8 challengeKind; // ChallengeKind tag (settlement.rs:2227-2233) when status is CHALLENGED.
-        bytes32 batchId;
-        bytes32 successorRoot;
-        bytes32 activityRoot;
-        bytes32 payoutRoot;
-        uint64 activityOperations;
-        uint64 activityFloor;
-        uint64 payoutOperations;
-        uint64 payoutFloor;
-        uint64 rowsStart;
-        uint64 rowsEnd;
-        uint64 successorLiability;
-        // keccak256 of the predecessor `Heads`, compared at finalization (settlement.rs:1647-1649).
-        bytes32 predecessorLogs;
-        // `earliest_withdrawal` of the registered batch (settlement.rs:431-439): its smallest
-        // `(deadline, account)`, or zero deadline when the batch is empty. Deadlines are positive.
-        uint64 withdrawalDeadline;
-        bytes32 withdrawalAccount;
-    }
-
-    /// @notice One run of unpulled deposits sharing an inclusion deadline (settlement.rs:280-287).
-    struct Run {
-        uint64 end;
-        uint64 deadline;
-        bytes32 account;
-    }
-
     /// @notice The parts of an `Epoch` that `epochRecord` returns.
     struct EpochView {
         bytes32 anchor;
@@ -279,16 +235,6 @@ contract BajillionSettlement {
         uint64 successorLiability;
         uint64 floorActivity;
         uint64 floorPayouts;
-    }
-
-    /// @dev The settlement-visible prefix the next frontier binds (settlement.rs:895-907, 1749-1770).
-    struct Head {
-        bytes32 stateRoot;
-        LogHead activity;
-        LogHead payouts;
-        uint64 rowsStart;
-        uint64 rowsEnd;
-        uint64 liability;
     }
 
     /// @dev Decoded `RootBundle` (transition.rs:128-143).
@@ -383,6 +329,19 @@ contract BajillionSettlement {
     error WithdrawalEncoding();
     error StateOpeningEncoding();
     error WithdrawalOrder();
+    // Terminal settlement (settlement.rs:3159-3314).
+    error OperatorNotHardFaulted();
+    error HardFaultAlreadySettled();
+    error HardFaultSettlementNotStarted();
+    error PreFaultBatchPending();
+    error CustodyMismatch();
+    error PendingDepositUnavailable();
+    error ClaimAlreadyConsumed();
+    // Embedding: a terminal-claim witness that does not match stored roots or digests, and the
+    // credit sweep.
+    error RecoveryWitness();
+    error RecoverySignature();
+    error NothingToRecover();
 
     // ---------------------------------------------------------------------------------------
     // Events
@@ -405,6 +364,15 @@ contract BajillionSettlement {
         uint64 indexed index, address indexed destination, uint64 amount, uint64 rangeStart, uint64 rangeEnd
     );
     event ChallengeProven(uint64 indexed epoch, bytes32 indexed batchId, Verdict verdict, uint64 invalidatedThrough);
+    event HardFaultSettlementStarted(
+        bytes32 frozenStateRoot, uint64 stateLiability, uint64 depositTotal, uint64 drainFrom, uint64 drainTo
+    );
+    event DepositRefunded(bytes32 indexed account, uint64 amount);
+    event HardFaultClaimed(
+        bytes32 indexed account, uint64 balance, address destination, uint64 withdrawn, uint64 residual
+    );
+    event HardFaultSettled();
+    event Recovered(bytes32 indexed account, address indexed recipient, uint64 amount);
     /// @notice A call that wrote the fence then failed with `reason` (the custom error's selector).
     event Rejected(bytes4 reason);
     /// @param detail The account for an expired deposit or withdrawal, the anchor for an expired
@@ -437,11 +405,10 @@ contract BajillionSettlement {
     /// @dev Requests decoded from one withdrawal batch; the crate leaves the bound to the embedding.
     uint256 internal constant MAX_WITHDRAWAL_RECORDS = 1024;
 
-    /// @dev Capacity of the epoch ring: registered plus admitted-but-unfinalized epochs. The crate
-    /// bounds neither (settlement.rs:235-239); a fixed ring keeps storage reusable.
-    uint256 public constant EPOCH_RING = 64;
-    /// @dev Capacity of the inbox ring. At most `INBOX_RING - 1` deposits may be unpulled.
-    uint256 public constant INBOX_RING = 1024;
+    /// @dev Capacity of the epoch ring (see `EPOCH_RING_SIZE`).
+    uint256 public constant EPOCH_RING = EPOCH_RING_SIZE;
+    /// @dev Capacity of the inbox ring (see `INBOX_RING_SIZE`).
+    uint256 public constant INBOX_RING = INBOX_RING_SIZE;
 
     // ---------------------------------------------------------------------------------------
     // Immutable deployment
@@ -530,6 +497,11 @@ contract BajillionSettlement {
     /// @dev Chain-queued withdrawals, replay ids and carried batches, kept by the linked
     /// `BajillionWithdrawals` library (see its `State`).
     Withdrawals.State internal withdrawalState;
+    /// @dev Terminal settlement, kept by the linked `BajillionRecovery` library.
+    Recovery.State internal recovery;
+    /// @dev Sum of `pendingDeposits`: unadmitted deposits, for the custody check at terminal
+    /// settlement (settlement.rs:1929-1943).
+    uint64 public pendingDepositTotal;
 
     // ---------------------------------------------------------------------------------------
     // Constructor
@@ -656,59 +628,20 @@ contract BajillionSettlement {
         if (!fenced && faultKind != FaultKind.None) revert OperatorHardFaulted();
     }
 
-    /// @dev `expired_reason` (settlement.rs:769-836).
+    /// @dev `expired_reason` (settlement.rs:769-836), in `BajillionLiveness`.
     function _expiredReason(uint64 now_)
         private
         view
         returns (FaultKind kind, uint64 expiredAt, bytes32 detail, uint64 epoch)
     {
-        // Every deposit shares one timeout, so the front run holds the earliest deadline.
-        bool depositExpired;
-        Run storage front = runs[runHead % INBOX_RING];
-        if (runHead < runTail && now_ >= front.deadline) depositExpired = true;
-
-        // Withdrawal attribution wins when both intake obligations expire together.
-        (uint64 wDeadline, bytes32 wAccount) = _earliestWithdrawalDeadline();
-        bool withdrawalExpired = wDeadline != 0 && now_ >= wDeadline;
-        FaultKind intakeKind;
-        uint64 intakeDeadline;
-        bytes32 intakeAccount;
-        if (withdrawalExpired && (!depositExpired || wDeadline <= front.deadline)) {
-            (intakeKind, intakeDeadline, intakeAccount) = (FaultKind.ExpiredWithdrawal, wDeadline, wAccount);
-        } else if (depositExpired) {
-            (intakeKind, intakeDeadline, intakeAccount) = (FaultKind.ExpiredDeposit, front.deadline, front.account);
-        }
-
-        bool registration;
-        uint64 firstExpired;
-        Epoch storage frontier = epochs[admittedEnd % EPOCH_RING];
-        // A live frontier is always promoted; the zero check only guards a stale ring record.
-        if (registeredEnd > admittedEnd && frontier.admissionDeadline != 0 && now_ > frontier.admissionDeadline) {
-            registration = true;
-            // A later timestamp was observed, so the deadline is below u64::MAX.
-            firstExpired = frontier.admissionDeadline + 1;
-        }
-
-        // At a shared first-fault instant the registration reason wins (settlement.rs:827-835).
-        if (registration && (intakeKind == FaultKind.None || firstExpired <= intakeDeadline)) {
-            return (FaultKind.ExpiredRegistration, frontier.admissionDeadline, frontier.anchor, admittedEnd);
-        }
-        return (intakeKind, intakeDeadline, intakeAccount, 0);
-    }
-
-    /// @dev `earliest_withdrawal_deadline` (settlement.rs:756-767): the smallest
-    /// `(deadline, account)` over chain-queued requests and admitted unfinalized closes. Requests
-    /// carried only by registrations are not counted, as upstream. Zero deadline when none.
-    function _earliestWithdrawalDeadline() private view returns (uint64 deadline, bytes32 account) {
-        account = withdrawalState.head;
-        if (account != 0) deadline = withdrawalState.pending[account].deadline;
-        for (uint64 e = expectedEpoch; e < admittedEnd; ++e) {
-            Epoch storage rec = epochs[e % EPOCH_RING];
-            uint64 d = rec.withdrawalDeadline;
-            if (d != 0 && (deadline == 0 || Withdrawals._before(d, rec.withdrawalAccount, deadline, account))) {
-                (deadline, account) = (d, rec.withdrawalAccount);
-            }
-        }
+        uint8 k;
+        (k, expiredAt, detail, epoch) = Liveness.expiredReason(
+            runs,
+            epochs,
+            withdrawalState,
+            Liveness.Clock(now_, runHead, runTail, expectedEpoch, admittedEnd, registeredEnd)
+        );
+        kind = FaultKind(k);
     }
 
     /// @dev `enter_hard_fault` (settlement.rs:838-859): fence admission at the next admission
@@ -767,6 +700,7 @@ contract BajillionSettlement {
         // forge-lint: disable-next-line(unsafe-typecast) bounded by the checks above
         custodyBalance = uint64(custody);
         unfinalizedDepositTotal += amount;
+        pendingDepositTotal += amount;
         inboxChain[(uint256(index) + 1) % INBOX_RING] =
             keccak256(abi.encodePacked(inboxChain[index % INBOX_RING], account, amount));
         intake = index + 1;
@@ -871,12 +805,11 @@ contract BajillionSettlement {
         if (Codec.readBytes32(context, 0) != _anchor(epoch, depositRoot, withdrawalRoot, limits)) {
             revert TransitionEpochAnchor();
         }
-        (bytes32[] memory owedAccounts, uint64[] memory owedIndices) =
-            _checkPulledAggregate(end, records, count, pulledDeposits);
+        _checkPulledAggregate(end, records, count, pulledDeposits);
         (uint64 admissionDeadline, uint64 challengeDeadline) = _frontierDeadlines(now_);
         uint64 withdrawalDeadline;
         bytes32 withdrawalAccount;
-        if (withdrawalCount != 0 || owedAccounts.length != 0) {
+        if (withdrawalCount != 0 || end != pulled) {
             (withdrawalDeadline, withdrawalAccount) = Withdrawals.register(
                 withdrawalState,
                 _withdrawalConfig(),
@@ -884,8 +817,8 @@ contract BajillionSettlement {
                 now_,
                 withdrawals,
                 MAX_WITHDRAWAL_RECORDS,
-                owedAccounts,
-                owedIndices,
+                pulledDeposits,
+                pulled,
                 _latestChallengeDeadline(challengeDeadline)
             );
         }
@@ -905,7 +838,7 @@ contract BajillionSettlement {
         rec.admissionDeadline = 0;
         rec.challengeDeadline = 0;
         rec.withdrawalTotal = 0;
-        rec.status = REGISTERED;
+        rec.status = BATCH_REGISTERED;
         rec.withdrawalDeadline = withdrawalDeadline;
         rec.withdrawalAccount = withdrawalAccount;
 
@@ -919,11 +852,6 @@ contract BajillionSettlement {
         _promote(admissionDeadline, challengeDeadline);
         return Status.Ok;
     }
-
-    uint8 internal constant REGISTERED = 1;
-    uint8 internal constant PENDING = 2;
-    uint8 internal constant CHALLENGED = 3;
-    uint8 internal constant INVALIDATED = 4;
 
     /// @dev `promote` (settlement.rs:1418-1440). The predecessor fields are not copied here: the
     /// head cannot change between promotion and admission (only the frontier can be admitted, and
@@ -949,20 +877,18 @@ contract BajillionSettlement {
     }
 
     /// @dev Check that `records` is exactly the per-account aggregate of the deposits at
-    /// `[pulled, end)`, and return the chain-queued withdrawals at those indices. Replaying the
+    /// `[pulled, end)`; chain-queued withdrawals in the witness are checked by
+    /// `BajillionWithdrawals.register`. Replaying the
     /// inbox chain authenticates `pulledDeposits`; the aggregate must then match record for record.
     /// Rust asserts only `<=` (settlement.rs:1290-1308) because it cannot see individual deposits;
     /// the contract can, so it requires equality.
     function _checkPulledAggregate(uint64 end, bytes calldata records, uint256 count, bytes calldata pulledDeposits)
         private
         view
-        returns (bytes32[] memory owedAccounts, uint64[] memory owedIndices)
     {
         if (pulledDeposits.length != uint256(end - pulled) * 40) revert DepositAggregate();
-        bool ok;
-        bytes32 chain;
-        (ok, chain, owedAccounts, owedIndices) =
-            AdmissionVerifier.pulledAggregate(records, count, pulledDeposits, inboxChain[pulled % INBOX_RING], pulled);
+        (bool ok, bytes32 chain) =
+            AdmissionVerifier.pulledAggregate(records, count, pulledDeposits, inboxChain[pulled % INBOX_RING]);
         if (!ok || chain != inboxChain[end % INBOX_RING]) revert DepositAggregate();
     }
 
@@ -999,7 +925,7 @@ contract BajillionSettlement {
                 || a.header
                     != sha256(
                         abi.encodePacked(
-                            HEADER_ROOT_NAMESPACE, _closeContext(rec, epoch, limits, hd), a.roots, a.withdrawalTotal
+                            HEADER_ROOT_NAMESPACE, _closeContext(rec, epoch, hd), a.roots, a.withdrawalTotal
                         )
                     )
         ) revert TransitionHeaderRoot();
@@ -1014,7 +940,8 @@ contract BajillionSettlement {
 
         batchId = sha256(abi.encodePacked(BATCH_ID_NAMESPACE, a.header));
         // Registration pulled only recorded deposits, and only admission reduces their totals.
-        (bytes calldata records, uint256 count,) = _decodeDeposits(a.deposits);
+        (bytes calldata records, uint256 count, uint64 admittedDeposits) = _decodeDeposits(a.deposits);
+        pendingDepositTotal -= admittedDeposits;
         for (uint256 i; i < count; ++i) {
             pendingDeposits[Codec.readBytes32(records, i * 40)] -= Codec.readU64(records, i * 40 + 32);
         }
@@ -1024,7 +951,7 @@ contract BajillionSettlement {
             Withdrawals.retire(withdrawalState, a.withdrawals, MAX_WITHDRAWAL_RECORDS, maxDestinationBytes);
         }
         rec.withdrawalTotal = a.withdrawalTotal;
-        rec.status = PENDING;
+        rec.status = BATCH_PENDING;
         rec.batchId = batchId;
         rec.successorRoot = roots.successor;
         rec.activityRoot = roots.change.root;
@@ -1121,11 +1048,13 @@ contract BajillionSettlement {
     function finalize() external returns (Status) {
         uint64 now_ = _now();
         bool fenced = _observeTime(now_);
+        // Settled implies faulted, so this call wrote no fence.
+        if (recovery.settled) revert HardFaultAlreadySettled();
         uint64 epoch = expectedEpoch;
         if (admittedEnd == epoch) return _reject(fenced, Status.NoPendingBatch);
         if (epoch == type(uint64).max) return _reject(fenced, Status.EpochOverflow);
         Epoch storage rec = epochs[epoch % EPOCH_RING];
-        if (rec.status != PENDING) return _reject(fenced, Status.BatchInvalidated);
+        if (rec.status != BATCH_PENDING) return _reject(fenced, Status.BatchInvalidated);
         if (now_ <= rec.challengeDeadline) return _reject(fenced, Status.ChallengeWindowOpen);
         LogHead memory payouts = finalizedPayouts;
         if (rec.predecessorLogs != _logsHash(finalizedActivity, payouts)) {
@@ -1183,32 +1112,19 @@ contract BajillionSettlement {
     ) external returns (Status, Verdict) {
         uint64 now_ = _now();
         bool fenced = _observeTime(now_);
-        if (encoded.length > maxChallengeBytes) return _rejectChallenge(fenced, ChallengeTooLarge.selector);
-        bytes4 err = BajillionChallenge.decode(encoded);
-        if (err != bytes4(0)) return _rejectChallenge(fenced, err);
-
-        // Find the admitted close (settlement.rs:1583-1596).
-        uint64 epoch = expectedEpoch;
-        while (epoch < admittedEnd && epochs[epoch % EPOCH_RING].batchId != batchId) {
-            ++epoch;
-        }
-        if (epoch == admittedEnd) return _rejectChallenge(fenced, NoPendingBatch.selector);
-        Epoch storage rec = epochs[epoch % EPOCH_RING];
-        if (rec.status == CHALLENGED) return _rejectChallenge(fenced, AlreadyChallenged.selector);
-        if (rec.status == INVALIDATED) return _rejectChallenge(fenced, BatchInvalidated.selector);
-        if (now_ > rec.challengeDeadline) return _rejectChallenge(fenced, ChallengeExpired.selector);
-
-        bool proven;
-        uint8 kind;
-        (err, proven, kind) = BajillionChallenge.adjudicate(batchId, operator, context, roots, withdrawalTotal, encoded);
+        // Settled implies faulted, so this call wrote no fence.
+        if (recovery.settled) revert HardFaultAlreadySettled();
+        (bytes4 err, bool proven, uint8 kind, uint64 epoch) = BajillionChallenge.challenge(
+            epochs,
+            BajillionChallenge.Call(batchId, operator, now_, expectedEpoch, admittedEnd, maxChallengeBytes),
+            context,
+            roots,
+            withdrawalTotal,
+            encoded
+        );
         if (err != bytes4(0)) return _rejectChallenge(fenced, err);
         if (!proven) return (Status.Ok, Verdict.NoContradiction);
 
-        rec.status = CHALLENGED;
-        rec.challengeKind = kind;
-        for (uint64 e = epoch + 1; e < admittedEnd; ++e) {
-            epochs[e % EPOCH_RING].status = INVALIDATED;
-        }
         invalidFrom = batchId;
         Verdict verdict = Verdict(kind + 1);
         emit ChallengeProven(epoch, batchId, verdict, admittedEnd - 1);
@@ -1218,9 +1134,13 @@ contract BajillionSettlement {
 
     /// @dev Return a `Rejected` status if this call wrote the fence; otherwise revert with `err`.
     function _rejectChallenge(bool fenced, bytes4 err) private returns (Status, Verdict) {
+        return (_rejectWith(fenced, err), Verdict.NoContradiction);
+    }
+
+    function _rejectWith(bool fenced, bytes4 err) private returns (Status) {
         if (!fenced) _revertWith(err);
         emit Rejected(err);
-        return (Status.Rejected, Verdict.NoContradiction);
+        return Status.Rejected;
     }
 
     /// @dev Return `status` if this call wrote the fence; otherwise revert with its error.
@@ -1233,6 +1153,100 @@ contract BajillionSettlement {
         if (status == Status.EpochOverflow) revert EpochOverflow();
         if (status == Status.CustodyArithmetic) revert CustodyArithmetic();
         revert OperatorHardFaulted();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Terminal settlement
+    // ---------------------------------------------------------------------------------------
+
+    /// @notice Freeze the last finalized root for independent terminal claims
+    /// (`begin_hard_fault_settlement`, settlement.rs:1876-1986). Drains the admitted pipeline,
+    /// whose deposits become refundable and whose withdrawals route at `claimHardFault`.
+    /// Idempotent once started.
+    function beginHardFaultSettlement() external {
+        (bool startedNow, bool settledNow) = Recovery.begin(recovery, epochs, _ledger());
+        if (!startedNow) return;
+        emit HardFaultSettlementStarted(
+            currentStateRoot, currentLiability, unfinalizedDepositTotal, expectedEpoch, admittedEnd
+        );
+        admittedEnd = expectedEpoch;
+        registeredEnd = expectedEpoch;
+        if (settledNow) _settle();
+    }
+
+    /// @notice Refund every unadmitted deposit of `account` once (`claim_pending_deposit`,
+    /// settlement.rs:1796-1874), credited to the account for `sweepRecovered`.
+    /// @param pipelineDeposits After terminal settlement starts: the admitted `DepositBatch` of
+    /// each drained close in order, checked against its registered root. Empty before.
+    function claimPendingDeposit(bytes32 account, bytes[] calldata pipelineDeposits)
+        external
+        returns (Status, uint64 amount)
+    {
+        bool fenced = _observeTime(_now());
+        if (faultKind == FaultKind.None) revert OperatorNotHardFaulted();
+        (bytes4 err, uint64 refunded, uint64 unpulled, bool settledNow) =
+            Recovery.refund(recovery, epochs, pendingDeposits, account, pipelineDeposits, _ledger());
+        if (err != bytes4(0)) return (_rejectWith(fenced, err), 0);
+        pendingDepositTotal -= unpulled;
+        custodyBalance -= refunded;
+        unfinalizedDepositTotal -= refunded;
+        emit DepositRefunded(account, refunded);
+        if (settledNow) _settle();
+        return (Status.Ok, refunded);
+    }
+
+    /// @notice Release one account from the frozen root (`claim_hard_fault`,
+    /// settlement.rs:1988-2062): its signed withdrawal, if any, pays its destination and the rest
+    /// of its balance is credited to the account for `sweepRecovered`.
+    /// @param opening The crate's `StateOpening` at the frozen root.
+    /// @param request The account's chain-queued or drained-close withdrawal request verbatim, or
+    /// empty when it has none. Checked against the stored digest.
+    function claimHardFault(bytes calldata opening, bytes calldata request) external {
+        (Recovery.Release memory r, bool settledNow) = Recovery.claimState(
+            recovery,
+            withdrawalState,
+            faultKind != FaultKind.None,
+            unfinalizedDepositTotal,
+            opening,
+            request,
+            maxDestinationBytes
+        );
+        if (custodyBalance < r.balance) revert CustodyArithmetic();
+        custodyBalance -= r.balance;
+        emit HardFaultClaimed(r.account, r.balance, r.destination, r.withdrawn, r.residual);
+        if (settledNow) _settle();
+        if (r.withdrawn != 0 && !ITIP20(asset).transfer(r.destination, r.withdrawn)) revert TransferFailed();
+    }
+
+    /// @notice Pay an account's credited refunds and residuals to `recipient`, authorized by the
+    /// account's signature (see `BajillionRecovery.sweep`). Our addition: upstream returns these
+    /// amounts to the clearing account, which is an Ed25519 key with no Tempo address.
+    function sweepRecovered(bytes32 account, address recipient, bytes calldata signature) external {
+        uint64 amount = Recovery.sweep(recovery, deployment, account, recipient, signature);
+        emit Recovered(account, recipient, amount);
+        if (!ITIP20(asset).transfer(recipient, amount)) revert TransferFailed();
+    }
+
+    /// @dev The custody ledger the recovery library reads.
+    function _ledger() private view returns (Recovery.Ledger memory) {
+        return Recovery.Ledger(
+            faultKind != FaultKind.None,
+            expectedEpoch,
+            admittedEnd,
+            pendingDepositTotal,
+            unfinalizedDepositTotal,
+            currentLiability,
+            custodyBalance,
+            currentStateRoot
+        );
+    }
+
+    /// @dev `finish_hard_fault_if_drained` (settlement.rs:2077-2081) once the library reports that
+    /// nothing remains to claim.
+    function _settle() private {
+        currentLiability = 0;
+        custodyBalance = 0;
+        emit HardFaultSettled();
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1329,37 +1343,9 @@ contract BajillionSettlement {
         return abi.encodePacked(l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7]);
     }
 
-    /// @dev `CloseContext` encoding (transition.rs:870-882): `EpochContext` (transition.rs:690-699),
-    /// then the predecessor state root, log heads, rows and liability, both deadlines and floors.
-    function _closeContext(Epoch storage rec, uint64 epoch, bytes memory limits, Head memory hd)
-        private
-        view
-        returns (bytes memory)
-    {
-        bytes memory epochContext = abi.encodePacked(
-            rec.anchor, epoch, operator, deployment, rec.depositRoot, rec.withdrawalRoot, limits, committeeCommitment
-        );
-        return bytes.concat(
-            epochContext,
-            abi.encodePacked(
-                hd.stateRoot,
-                hd.activity.root,
-                hd.activity.operations,
-                hd.activity.floor,
-                hd.payouts.root,
-                hd.payouts.operations,
-                hd.payouts.floor
-            ),
-            abi.encodePacked(
-                hd.rowsStart,
-                hd.rowsEnd,
-                hd.liability,
-                rec.admissionDeadline,
-                rec.challengeDeadline,
-                rec.floorActivity,
-                rec.floorPayouts
-            )
-        );
+    /// @dev `CloseContext` encoding, in `AdmissionVerifier.closeContext`.
+    function _closeContext(Epoch storage rec, uint64 epoch, Head memory hd) private view returns (bytes memory) {
+        return AdmissionVerifier.closeContext(rec, epoch, operator, deployment, committeeCommitment, hd);
     }
 
     function _logsHash(LogHead memory activity, LogHead memory payouts) private pure returns (bytes32) {
@@ -1448,7 +1434,7 @@ contract BajillionSettlement {
     function frontierContext() external view returns (bytes memory) {
         if (registeredEnd <= admittedEnd) revert NoRegisteredEpoch();
         Epoch storage rec = epochs[admittedEnd % EPOCH_RING];
-        return _closeContext(rec, admittedEnd, _limits(rec), _head());
+        return _closeContext(rec, admittedEnd, _head());
     }
 
     /// @notice An account's chain-queued withdrawal, if any (`deadline` zero when none).
@@ -1468,12 +1454,28 @@ contract BajillionSettlement {
 
     /// @notice The deadline of `account`'s request in `epoch`'s registered batch, or zero.
     function carriedWithdrawalDeadline(uint64 epoch, bytes32 account) external view returns (uint64) {
-        return withdrawalState.carried[epoch][account];
+        return uint64(uint256(withdrawalState.carried[epoch][account]));
     }
 
     /// @notice The deadline until which a withdrawal id stays consumed.
     function withdrawalReplayExpiry(bytes32 id) external view returns (uint64) {
         return withdrawalState.replayExpiry[id];
+    }
+
+    /// @notice Terminal settlement: whether it started (and has not finished), whether it
+    /// finished, the frozen root, the state liability still unclaimed, and the drained closes.
+    function terminal()
+        external
+        view
+        returns (bool started, bool settled, bytes32 frozenRoot, uint64 remaining, uint64 drainFrom, uint64 drainTo)
+    {
+        Recovery.State storage r = recovery;
+        return (r.started, r.settled, r.frozenRoot, r.remainingStateLiability, r.drainFrom, r.drainTo);
+    }
+
+    /// @notice Refunds and residuals credited to `account` and not yet swept, and its sweep nonce.
+    function recoveredCredit(bytes32 account) external view returns (uint64 amount, uint64 nonce) {
+        return (recovery.credit[account], recovery.sweepNonce[account]);
     }
 
     /// @notice The inbox chain value committing every deposit before `index`, while retained.

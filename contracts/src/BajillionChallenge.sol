@@ -5,6 +5,7 @@ import { LibMerkle } from "commonware/merkle/LibMerkle.sol";
 import { LibQMDBCommon } from "commonware/qmdb/LibQMDBCommon.sol";
 import { LibClearingCodec as Codec } from "./verify/LibClearingCodec.sol";
 import { Ed25519Verifier } from "./verify/LibEd25519.sol";
+import { BATCH_CHALLENGED, BATCH_INVALIDATED, EPOCH_RING_SIZE, Epoch } from "./BajillionTypes.sol";
 
 /// @title Bajillion challenge adjudication
 /// @notice A port of `challenge::adjudicate` and `challenge::decode_bounded` from Commonware's
@@ -44,6 +45,21 @@ library BajillionChallenge {
     error ChallengeInvalidPayerSignature();
     error ChallengeInvalidOperatorSignature();
     error ChallengeHeaderRoot();
+    error ChallengeTooLarge();
+    error ChallengeExpired();
+    error NoPendingBatch();
+    error AlreadyChallenged();
+    error BatchInvalidated();
+
+    /// @notice What `challenge` needs from the settlement contract besides the evidence.
+    struct Call {
+        bytes32 batchId;
+        bytes32 operator;
+        uint64 now_;
+        uint64 expectedEpoch;
+        uint64 admittedEnd;
+        uint64 maxBytes;
+    }
 
     bytes internal constant HEADER_ROOT_NAMESPACE = "_COMMONWARE_CLEARING_HEADER_ROOT"; // transition.rs:38
     bytes internal constant BATCH_ID_NAMESPACE = "_COMMONWARE_CLEARING_BATCH_ID"; // transition.rs:36
@@ -63,6 +79,48 @@ library BajillionChallenge {
         bytes32 headRoot;
         uint64 headOperations;
         uint64 headFloor;
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // Entry point
+    // -------------------------------------------------------------------------------------------
+
+    /// @notice `challenge_encoded` after time is observed (settlement.rs:1559-1614), on the
+    /// settlement contract's epoch ring: the outer byte bound, the structural decode, the target
+    /// among admitted closes `[expectedEpoch, admittedEnd)`, its status and inclusive deadline, then
+    /// adjudication. A proven challenge marks the target challenged and every later admitted close
+    /// invalidated (settlement.rs:1604-1609); the caller records `invalid_from` and the hard fault.
+    /// @return err A custom-error selector, or zero.
+    /// @return proven Whether a contradiction was proven.
+    /// @return kind The proven `ChallengeKind` tag.
+    /// @return epoch The target's epoch.
+    function challenge(
+        mapping(uint256 => Epoch) storage epochs,
+        Call memory c,
+        bytes calldata context,
+        bytes calldata roots,
+        uint64 withdrawalTotal,
+        bytes calldata encoded
+    ) external returns (bytes4 err, bool proven, uint8 kind, uint64 epoch) {
+        if (encoded.length > c.maxBytes) return (ChallengeTooLarge.selector, false, 0, 0);
+        err = decode(encoded);
+        if (err != bytes4(0)) return (err, false, 0, 0);
+        epoch = c.expectedEpoch;
+        while (epoch < c.admittedEnd && epochs[epoch % EPOCH_RING_SIZE].batchId != c.batchId) {
+            ++epoch;
+        }
+        if (epoch == c.admittedEnd) return (NoPendingBatch.selector, false, 0, 0);
+        Epoch storage rec = epochs[epoch % EPOCH_RING_SIZE];
+        if (rec.status == BATCH_CHALLENGED) return (AlreadyChallenged.selector, false, 0, 0);
+        if (rec.status == BATCH_INVALIDATED) return (BatchInvalidated.selector, false, 0, 0);
+        if (c.now_ > rec.challengeDeadline) return (ChallengeExpired.selector, false, 0, 0);
+        (err, proven, kind) = adjudicate(c.batchId, c.operator, context, roots, withdrawalTotal, encoded);
+        if (err != bytes4(0) || !proven) return (err, false, 0, epoch);
+        rec.status = BATCH_CHALLENGED;
+        rec.challengeKind = kind;
+        for (uint64 e = epoch + 1; e < c.admittedEnd; ++e) {
+            epochs[e % EPOCH_RING_SIZE].status = BATCH_INVALIDATED;
+        }
     }
 
     // -------------------------------------------------------------------------------------------

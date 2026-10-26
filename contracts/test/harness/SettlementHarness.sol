@@ -8,6 +8,7 @@ pragma solidity ^0.8.36;
 
 import { BajillionClaims } from "../../src/BajillionClaims.sol";
 import { BajillionSettlement } from "../../src/BajillionSettlement.sol";
+import { LogHead } from "../../src/BajillionTypes.sol";
 
 contract SettlementHarness is BajillionSettlement {
     constructor(DeploymentArgs memory d) BajillionSettlement(d) { }

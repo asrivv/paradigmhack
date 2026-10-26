@@ -61,13 +61,17 @@ contract DifferentialTest is Test {
     uint8 internal constant CLAIM_WITHDRAWAL = 6;
     uint8 internal constant FAULT_EXPIRED = 7;
     uint8 internal constant ADVANCE_TIME = 8;
+    uint8 internal constant BEGIN_HARD_FAULT_SETTLEMENT = 9;
+    uint8 internal constant CLAIM_HARD_FAULT = 10;
+    uint8 internal constant CLAIM_PENDING_DEPOSIT = 11;
+    uint8 internal constant KINDS = 12;
 
     string internal constant ORACLE = "../offchain/target/release/bajillion-oracle";
 
     /// @dev The README's genesis state vector (offchain/oracle/README.md, "Test vector").
     bytes internal constant GENESIS_PREIMAGE =
-        hex"42414a494c4c494f4e5f4f5241434c455f53544154455f56310000000000000000000000000000000100000000000000010000000000000001000000000000000000000000000000000000000000550b70a7c0fd428441985a82b1e8b1e9d64fb376d4d2b451f25d368fdff437d100000000000000010000000000000000550b70a7c0fd428441985a82b1e8b1e9d64fb376d4d2b451f25d368fdff437d1000000000000000100000000000000006d68250818907071bbe9eea0db384fe1d96aaa6fad1227dbd1d8875f84ae23e70000000000000000000000c8000000000000000000000000000000c8000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-    bytes32 internal constant GENESIS_DIGEST = 0x5cf6f6c247c1f0f401825bf6c145f66ad6b40952e49af543850d1bc6f6b90f73;
+        hex"42414a494c4c494f4e5f4f5241434c455f53544154455f56320000000000000000000000000000000100000000000000010000000000000001000000000000000000000000000000000000000000550b70a7c0fd428441985a82b1e8b1e9d64fb376d4d2b451f25d368fdff437d100000000000000010000000000000000550b70a7c0fd428441985a82b1e8b1e9d64fb376d4d2b451f25d368fdff437d1000000000000000100000000000000006d68250818907071bbe9eea0db384fe1d96aaa6fad1227dbd1d8875f84ae23e70000000000000000000000c8000000000000000000000000000000c80000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    bytes32 internal constant GENESIS_DIGEST = 0x0bfbe198fb3e2b7d497964cc76381a097272a777c535b3de9fa7eb53c2233ee3;
 
     MockTIP20 internal token;
     BajillionSettlement internal settlement;
@@ -79,6 +83,11 @@ contract DifferentialTest is Test {
     mapping(uint64 => bytes) internal registeredDeposits;
     mapping(uint64 => bytes) internal registeredWithdrawals;
     mapping(bytes32 => Target) internal targets;
+    /// @dev The last request each account queued, for terminal-claim witnesses.
+    mapping(bytes32 => bytes) internal queuedRequest;
+    /// @dev Every account that deposited or claimed, for the credit term of the solvency check.
+    bytes32[] internal accounts;
+    mapping(bytes32 => bool) internal noted;
     /// @dev The target an in-flight admission would create, committed only if it succeeds.
     bytes32 internal admittingId;
     Target internal admitting;
@@ -118,11 +127,11 @@ contract DifferentialTest is Test {
         assertEq(skips[0], "NOT APPLICABLE recordDeposit reusing a deposit id");
 
         // The generator emits every defined kind, including queueWithdrawal, and no unknown one.
-        bool[9] memory seen;
+        bool[12] memory seen;
         for (uint64 seed; seed < 64; ++seed) {
             Op[] memory ops = generate(seed);
             for (uint256 i; i < ops.length; ++i) {
-                assertTrue(ops[i].kind <= ADVANCE_TIME, "generated an unknown kind");
+                assertTrue(ops[i].kind < KINDS, "generated an unknown kind");
                 seen[ops[i].kind] = true;
             }
         }
@@ -179,7 +188,7 @@ contract DifferentialTest is Test {
         for (uint256 i; i < script.length; ++i) {
             ops[i].kind = script[i];
         }
-        bool[9] memory succeeded;
+        bool[12] memory succeeded;
         for (uint64 seed; seed < 16; ++seed) {
             uint256 snapshot = vm.snapshotState();
             (Op[] memory applied, uint16[] memory statuses) = _differential(seed, ops);
@@ -269,14 +278,17 @@ contract DifferentialTest is Test {
         for (uint256 i; i < length; ++i) {
             uint256 r = uint256(keccak256(abi.encode(seed, i))) % 100;
             uint8 kind;
-            if (r < 14) kind = RECORD_DEPOSIT;
-            else if (r < 22) kind = QUEUE_WITHDRAWAL;
-            else if (r < 34) kind = REGISTER_EPOCH;
-            else if (r < 48) kind = ADMIT;
-            else if (r < 56) kind = CHALLENGE;
-            else if (r < 67) kind = FINALIZE;
-            else if (r < 75) kind = CLAIM_WITHDRAWAL;
-            else if (r < 78) kind = FAULT_EXPIRED;
+            if (r < 13) kind = RECORD_DEPOSIT;
+            else if (r < 20) kind = QUEUE_WITHDRAWAL;
+            else if (r < 31) kind = REGISTER_EPOCH;
+            else if (r < 44) kind = ADMIT;
+            else if (r < 52) kind = CHALLENGE;
+            else if (r < 62) kind = FINALIZE;
+            else if (r < 68) kind = CLAIM_WITHDRAWAL;
+            else if (r < 71) kind = FAULT_EXPIRED;
+            else if (r < 74) kind = BEGIN_HARD_FAULT_SETTLEMENT;
+            else if (r < 78) kind = CLAIM_HARD_FAULT;
+            else if (r < 82) kind = CLAIM_PENDING_DEPOSIT;
             else kind = ADVANCE_TIME;
             ops[i].kind = kind;
         }
@@ -370,7 +382,7 @@ contract DifferentialTest is Test {
         // (the differential deployment has no bond).
         assertEq(
             token.balanceOf(address(settlement)),
-            uint256(settlement.custodyBalance()) + settlement.claimableBalance(),
+            uint256(settlement.custodyBalance()) + settlement.claimableBalance() + _creditOutstanding(),
             "solvency"
         );
     }
@@ -438,6 +450,18 @@ contract DifferentialTest is Test {
             return s.call(abi.encodeCall(BajillionSettlement.claimWithdrawal, (_predecessor(_position(claim)), claim)));
         }
         if (op.kind == FAULT_EXPIRED) return s.call(abi.encodeCall(BajillionSettlement.faultExpired, ()));
+        if (op.kind == BEGIN_HARD_FAULT_SETTLEMENT) {
+            return s.call(abi.encodeCall(BajillionSettlement.beginHardFaultSettlement, ()));
+        }
+        if (op.kind == CLAIM_HARD_FAULT) {
+            bytes memory opening = abi.decode(op.args, (bytes));
+            return s.call(abi.encodeCall(BajillionSettlement.claimHardFault, (opening, _requestWitness(opening))));
+        }
+        if (op.kind == CLAIM_PENDING_DEPOSIT) {
+            bytes32 account = abi.decode(op.args, (bytes32));
+            _noteAccount(account);
+            return s.call(abi.encodeCall(BajillionSettlement.claimPendingDeposit, (account, _drainedDeposits())));
+        }
         if (op.kind == QUEUE_WITHDRAWAL) {
             (bytes memory request, bytes memory opening) = abi.decode(op.args, (bytes, bytes));
             return s.call(
@@ -463,7 +487,10 @@ contract DifferentialTest is Test {
     /// @dev Status-returning methods put `Status` in the first word; `faultExpired` and
     /// `claimWithdrawal` either revert or succeed.
     function _returnedCode(uint8 kind, bytes memory ret) internal view returns (uint16) {
-        if (kind == FAULT_EXPIRED || kind == CLAIM_WITHDRAWAL) return OracleStatus.OK;
+        if (
+            kind == FAULT_EXPIRED || kind == CLAIM_WITHDRAWAL || kind == BEGIN_HARD_FAULT_SETTLEMENT
+                || kind == CLAIM_HARD_FAULT
+        ) return OracleStatus.OK;
         BajillionSettlement.Status status = BajillionSettlement.Status(abi.decode(ret, (uint8)));
         if (status != BajillionSettlement.Status.Rejected) return OracleStatus.fromStatus(status);
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -480,9 +507,11 @@ contract DifferentialTest is Test {
         if (op.kind == RECORD_DEPOSIT) {
             (, bytes32 account, uint64 amount) = abi.decode(op.args, (bytes32, bytes32, uint64));
             inbox.push(abi.encodePacked(account, amount));
+            _noteAccount(account);
         } else if (op.kind == QUEUE_WITHDRAWAL) {
             (bytes memory request,) = abi.decode(op.args, (bytes, bytes));
             inbox.push(abi.encodePacked(bytes32(request), uint64(0)));
+            queuedRequest[bytes32(request)] = request;
         } else if (op.kind == REGISTER_EPOCH) {
             (,, bytes memory deposits, bytes memory withdrawals) = abi.decode(op.args, (bytes, uint64, bytes, bytes));
             registeredDeposits[settlement.registeredEnd() - 1] = deposits;
@@ -558,6 +587,57 @@ contract DifferentialTest is Test {
             if (!(p.deadline < r.deadline || (p.deadline == r.deadline && cursor < r.account))) break;
             predecessor = cursor;
             cursor = p.next;
+        }
+    }
+
+    /// @dev The admitted deposit batches of the closes drained at terminal settlement, in order;
+    /// empty before it starts.
+    function _drainedDeposits() internal view returns (bytes[] memory batches) {
+        (bool started, bool settled,,, uint64 from, uint64 to) = settlement.terminal();
+        if (!started && !settled) return batches;
+        batches = new bytes[](to - from);
+        for (uint64 e = from; e < to; ++e) {
+            batches[e - from] = registeredDeposits[e];
+        }
+    }
+
+    /// @dev The opened account's one withdrawal request for `claimHardFault`: its chain-queued
+    /// request, else the one a drained close carried, else empty. When it has two the contract
+    /// rejects before reading the witness.
+    function _requestWitness(bytes memory opening) internal returns (bytes memory) {
+        if (opening.length < 32) return "";
+        bytes32 account = bytes32(opening);
+        _noteAccount(account);
+        if (settlement.pendingWithdrawal(account).deadline != 0) return queuedRequest[account];
+        (,,,, uint64 from, uint64 to) = settlement.terminal();
+        for (uint64 e = from; e < to; ++e) {
+            if (settlement.carriedWithdrawalDeadline(e, account) == 0) continue;
+            bytes memory batch = registeredWithdrawals[e];
+            (, WithdrawalCodec.Request[] memory requests,) = WithdrawalCodec.decodeBatch(batch, 1024, 256);
+            for (uint256 i; i < requests.length; ++i) {
+                if (requests[i].account != account) continue;
+                bytes memory request = new bytes(requests[i].end - requests[i].start);
+                for (uint256 k; k < request.length; ++k) {
+                    request[k] = batch[requests[i].start + k];
+                }
+                return request;
+            }
+        }
+        return "";
+    }
+
+    function _noteAccount(bytes32 account) internal {
+        if (noted[account]) return;
+        noted[account] = true;
+        accounts.push(account);
+    }
+
+    /// @dev Recovered amounts credited and not yet swept, over every account the run touched.
+    /// Fixture accounts can be credited by `claimHardFault` without depositing, so they count too.
+    function _creditOutstanding() internal view returns (uint256 total) {
+        for (uint256 i; i < accounts.length; ++i) {
+            (uint64 amount,) = settlement.recoveredCredit(accounts[i]);
+            total += amount;
         }
     }
 

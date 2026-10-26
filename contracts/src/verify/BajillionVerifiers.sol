@@ -9,6 +9,7 @@ import { LibBLS12381Point } from "./LibBLS12381Point.sol";
 import { LibBLS12381PoP } from "./LibBLS12381PoP.sol";
 import { LibClearingCodec as Codec } from "./LibClearingCodec.sol";
 import { LibVectorCommitment as Vector } from "./LibVectorCommitment.sol";
+import { Epoch, Head } from "../BajillionTypes.sol";
 
 /// @notice Linked-library entry points for the BLS checks BajillionSettlement performs. They live
 /// outside the settlement contract so it stays under the EIP-170 code size limit; the checks are
@@ -198,6 +199,51 @@ library AdmissionVerifier {
         return (bytes4(0), uint64(successor));
     }
 
+    /// @notice `CloseContext` encoding (transition.rs:870-882): `EpochContext` (transition.rs:690-699)
+    /// from the stored registration and the deployment's fixed fields, then the predecessor state
+    /// root, log heads, rows and liability from `hd`, both deadlines and the registration floors.
+    function closeContext(
+        Epoch storage rec,
+        uint64 epoch,
+        bytes32 operator,
+        bytes32 deployment,
+        bytes32 committee,
+        Head memory hd
+    ) public view returns (bytes memory) {
+        uint64[8] memory l = rec.limits;
+        bytes memory epochContext = abi.encodePacked(
+            rec.anchor,
+            epoch,
+            operator,
+            deployment,
+            rec.depositRoot,
+            rec.withdrawalRoot,
+            abi.encodePacked(l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7]),
+            committee
+        );
+        return bytes.concat(
+            epochContext,
+            abi.encodePacked(
+                hd.stateRoot,
+                hd.activity.root,
+                hd.activity.operations,
+                hd.activity.floor,
+                hd.payouts.root,
+                hd.payouts.operations,
+                hd.payouts.floor
+            ),
+            abi.encodePacked(
+                hd.rowsStart,
+                hd.rowsEnd,
+                hd.liability,
+                rec.admissionDeadline,
+                rec.challengeDeadline,
+                rec.floorActivity,
+                rec.floorPayouts
+            )
+        );
+    }
+
     /// @notice `DepositBatch` decoding (boundary.rs:172-200): `varint(count) || count * (account ||
     /// u64)`, accounts strictly increasing by bytes, amounts positive, total in u64, nothing
     /// trailing. Returns the offset of the packed records.
@@ -222,44 +268,56 @@ library AdmissionVerifier {
         return (true, pos, n, uint64(sum));
     }
 
-    /// @notice Replay the inbox chain over `pulled` (40-byte `account || amount` entries from
-    /// index `start`) and check that `records` is exactly the per-account aggregate of its deposits.
-    /// A zero amount marks a chain-queued withdrawal, which is returned instead of aggregated.
+    /// @notice Replay the inbox chain over `pulled` (40-byte `account || amount` entries) and
+    /// check that `records` is exactly the per-account aggregate of its deposits. A zero amount
+    /// marks a chain-queued withdrawal, which is skipped here; the withdrawal checks read those
+    /// entries from the same witness.
     /// @return ok False when an entry's account has no record or a record's sum differs.
     /// @return chain The chain value after the last entry, for the caller to compare.
-    function pulledAggregate(bytes calldata records, uint256 count, bytes calldata pulled, bytes32 chain, uint64 start)
+    function pulledAggregate(bytes calldata records, uint256 count, bytes calldata pulled, bytes32 chain)
         public
         pure
-        returns (bool ok, bytes32, bytes32[] memory owedAccounts, uint64[] memory owedIndices)
+        returns (bool ok, bytes32)
     {
         uint256 entries = pulled.length / 40;
-        if (pulled.length != entries * 40) return (false, chain, owedAccounts, owedIndices);
+        if (pulled.length != entries * 40) return (false, chain);
         uint256[] memory sums = new uint256[](count);
-        owedAccounts = new bytes32[](entries);
-        owedIndices = new uint64[](entries);
-        uint256 owed;
         for (uint256 k; k < entries; ++k) {
             bytes32 account = Codec.readBytes32(pulled, k * 40);
             uint64 amount = Codec.readU64(pulled, k * 40 + 32);
             chain = keccak256(abi.encodePacked(chain, account, amount));
-            if (amount == 0) {
-                owedAccounts[owed] = account;
-                // forge-lint: disable-next-line(unsafe-typecast) an inbox index fits in u64
-                owedIndices[owed++] = start + uint64(k);
-                continue;
-            }
+            if (amount == 0) continue;
             (bool found, uint256 pos) = _findDeposit(records, count, account);
-            if (!found) return (false, chain, owedAccounts, owedIndices);
+            if (!found) return (false, chain);
             sums[pos] += amount;
         }
         for (uint256 i; i < count; ++i) {
-            if (sums[i] != Codec.readU64(records, i * 40 + 32)) return (false, chain, owedAccounts, owedIndices);
+            if (sums[i] != Codec.readU64(records, i * 40 + 32)) return (false, chain);
         }
-        assembly ("memory-safe") {
-            mstore(owedAccounts, owed)
-            mstore(owedIndices, owed)
+        return (true, chain);
+    }
+
+    /// @notice An account's deposits in the closes drained at terminal settlement: `batches[i]`
+    /// is the `DepositBatch` encoding admitted for the close whose registered deposit root is
+    /// `roots[i]`. Upstream keeps these batches (settlement.rs:1912-1928); the contract keeps only
+    /// their roots, so a claimant supplies the batches, which admission published.
+    /// @return ok False when a batch does not decode or does not match its root.
+    function pipelineDeposit(bytes32 account, bytes[] calldata batches, bytes32[] calldata roots)
+        public
+        pure
+        returns (bool ok, uint256 amount)
+    {
+        if (batches.length != roots.length) return (false, 0);
+        for (uint256 i; i < batches.length; ++i) {
+            bytes calldata batch = batches[i];
+            (bool decoded, uint256 offset, uint256 count,) = decodeDeposits(batch);
+            if (!decoded) return (false, 0);
+            bytes calldata records = batch[offset:];
+            if (Vector.depositRoot(records, count) != roots[i]) return (false, 0);
+            (bool found, uint256 pos) = _findDeposit(records, count, account);
+            if (found) amount += Codec.readU64(records, pos * 40 + 32);
         }
-        return (true, chain, owedAccounts, owedIndices);
+        return (true, amount);
     }
 
     /// @dev Binary search a sorted deposit batch (`DepositBatch::record_for`, boundary.rs:140-147).

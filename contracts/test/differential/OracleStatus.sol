@@ -49,6 +49,8 @@ library OracleStatus {
         if (s == S.DepositCapacity.selector) return 15;
         if (s == S.DepositDeadlineOverflow.selector) return 16;
         if (s == S.WithdrawalWitness.selector) return 8;
+        if (s == S.ClaimAlreadyConsumed.selector) return 11;
+        if (s == S.PendingDepositUnavailable.selector) return 14;
         if (s == S.IneligibleDestination.selector) return 17;
         if (s == S.DestinationTooLarge.selector) return 18;
         if (s == S.WithdrawalOpening.selector) return 19;
@@ -60,13 +62,18 @@ library OracleStatus {
         if (s == S.WithdrawalNoticeOrder.selector) return 25;
         if (s == S.DeadlineNotReached.selector) return 26;
         if (s == S.OperatorHardFaulted.selector) return 27;
+        if (s == S.OperatorNotHardFaulted.selector) return 28;
+        if (s == S.HardFaultAlreadySettled.selector) return 29;
+        if (s == S.HardFaultSettlementNotStarted.selector) return 30;
         if (s == S.CustodyArithmetic.selector) return 31;
+        if (s == S.CustodyMismatch.selector) return 32;
         if (s == S.NoRegisteredEpoch.selector) return 33;
         if (s == S.EpochDeadlineOverflow.selector) return 34;
         if (s == S.InvalidCertificate.selector) return 35;
         if (s == S.NoPendingBatch.selector) return 36;
         if (s == S.AlreadyChallenged.selector) return 37;
         if (s == S.BatchInvalidated.selector) return 38;
+        if (s == S.PreFaultBatchPending.selector) return 39;
         if (s == S.ChallengeWindowOpen.selector) return 40;
         if (s == S.EpochOverflow.selector) return 41;
         // SettlementError::Transition(_).
@@ -101,10 +108,10 @@ library OracleStatus {
         // deposits (settlement.rs:1304-1307); the oracle reports the panic as 1004.
         if (s == S.DepositAggregate.selector) return PRECONDITION;
         // Embedding checks: point hints, committee calldata, fixed capacities, asset transfer,
-        // and the pending-list position hint.
+        // the pending-list position hint, and terminal-claim witnesses.
         if (
             s == S.CommitteeKeys.selector || s == S.PipelineFull.selector || s == S.InboxFull.selector
-                || s == S.TransferFailed.selector || s == S.WithdrawalOrder.selector
+                || s == S.TransferFailed.selector || s == S.WithdrawalOrder.selector || s == S.RecoveryWitness.selector
         ) return EMBEDDING;
         return UNMAPPED;
     }

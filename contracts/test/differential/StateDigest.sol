@@ -7,7 +7,7 @@ import { BajillionSettlement as S } from "../../src/BajillionSettlement.sol";
 /// digest"), computed from BajillionSettlement's public state. `stateDigest = sha256(preimage)`;
 /// integers are big-endian, so `abi.encodePacked` of fixed-width types writes the layout directly.
 library StateDigest {
-    bytes internal constant TAG = "BAJILLION_ORACLE_STATE_V1";
+    bytes internal constant TAG = "BAJILLION_ORACLE_STATE_V2";
 
     // Contract batch statuses (BajillionSettlement.sol: REGISTERED = 1 .. INVALIDATED = 4).
     uint8 private constant PENDING = 2;
@@ -36,6 +36,9 @@ library StateDigest {
         out = bytes.concat(
             out, abi.encodePacked(s.custodyBalance(), s.claimableBalance(), s.currentLiability()), _fault(s)
         );
+        // Terminal settlement: started (upstream keeps reporting it after it settles) and settled.
+        (bool started, bool settled,,,,) = s.terminal();
+        out = bytes.concat(out, abi.encodePacked(started || settled, settled));
     }
 
     /// @dev The registered epoch awaiting admission. After a hard fault the contract resets

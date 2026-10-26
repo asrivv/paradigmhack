@@ -4,6 +4,7 @@ pragma solidity ^0.8.36;
 import { Test } from "forge-std/Test.sol";
 import { LibBLS12381 as BLS } from "commonware/certificate/LibBLS12381.sol";
 import { BajillionSettlement } from "../src/BajillionSettlement.sol";
+import { Head } from "../src/BajillionTypes.sol";
 import { LibVectorCommitment as Vector } from "../src/verify/LibVectorCommitment.sol";
 import { SettlementHarness } from "./harness/SettlementHarness.sol";
 import { ScenarioBLS } from "./utils/ScenarioBLS.sol";
@@ -148,7 +149,7 @@ abstract contract SettlementBase is Test {
 
     /// @dev A RootBundle that satisfies `validate_close_amounts` with no rows and no withdrawals.
     function _roots(bytes32 successor) internal view returns (bytes memory) {
-        BajillionSettlement.Head memory h = settlement.head();
+        Head memory h = settlement.head();
         uint64 epoch = settlement.admittedEnd();
         BajillionSettlement.EpochView memory rec = settlement.epochRecord(epoch);
         return abi.encodePacked(
