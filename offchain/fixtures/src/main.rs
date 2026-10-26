@@ -33,7 +33,7 @@ use commonware_clearing::bajillion::{
         SendAuthorization, VECTOR_ACK_SIGNATURE_NAMESPACE, VECTOR_SEND_SIGNATURE_NAMESPACE,
         VectorAck, VectorSendBody,
     },
-    qmdb::account_key,
+    qmdb::{StateOpening, account_key},
     settlement::{Bounds, ClaimedRange, SettlementChain},
     transition::{
         BATCH_ID_HASH_NAMESPACE, CloseLimits, EPOCH_ANCHOR_HASH_NAMESPACE, EpochContext,
@@ -103,6 +103,13 @@ const CHALLENGE_DEADLINE: u64 = ADMISSION_DEADLINE + CHALLENGE_DURATION;
 /// Finalization requires a time strictly after the challenge deadline.
 const FINALIZE_AT: u64 = CHALLENGE_DEADLINE + 1;
 const WITHDRAWAL_DEADLINE: u64 = 400;
+/// Namespace of BajillionSettlement's recovery sweep authorization (our embedding, not the
+/// crate's): the account signs `deployment || recipient || u64 nonce`.
+const RECOVERY_SWEEP_NAMESPACE: &[u8] = b"_PARADIGMHACK_BAJILLION_RECOVERY";
+/// Recipient of the sample sweep authorization.
+const RECOVERY_RECIPIENT: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xa1, 0xa1,
+];
 
 /// Committee indices whose votes form the certificate. Three of four is the terminal example's
 /// consensus quorum (the crate itself accepts f + 1 = 2), and skipping index 1 makes the signer
@@ -287,6 +294,38 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
         )
     });
     let mut chain = chain.unwrap();
+
+    // Terminal settlement claims open account balances against a frozen root; when nothing has
+    // finalized, that root is genesis. One opening per account, checked by the crate.
+    for account in accounts.iter() {
+        let opening: StateOpening<Key, Digest> = replica
+            .state()
+            .opening_at(genesis.root(), genesis.operations(), account.key.clone())
+            .await
+            .unwrap();
+        assert!(opening.verify::<Sha256>(&genesis.root()).is_ok());
+        out.file(
+            &format!("state_opening_{}_genesis", account.name),
+            "qmdb::StateOpening<StrictVerifyingKey, sha256::Digest>",
+            "The account's balance opening at the genesis state root: account, u64 balance, then \
+             the current ordered QMDB membership proof over the MMB.",
+            opening.encode(),
+        );
+    }
+    let sweeper = fixture.account(WITHDRAWER);
+    let mut sweep = deployment.as_ref().to_vec();
+    sweep.extend_from_slice(&RECOVERY_RECIPIENT);
+    sweep.extend_from_slice(&0u64.to_be_bytes());
+    out.file(
+        "recovery_sweep_signature",
+        "curve25519::Signature",
+        "Account a's signature over union_unique(RECOVERY_SWEEP_NAMESPACE, deployment || \
+         recipient || u64 nonce 0) for BajillionSettlement.sweepRecovered.",
+        sweeper
+            .signer
+            .sign(RECOVERY_SWEEP_NAMESPACE, &sweep)
+            .encode(),
+    );
     out.trace(
         "settlement_new",
         "SettlementChain::new: commits the committee once for the deployment.",
@@ -1196,6 +1235,12 @@ async fn generate(runtime: deterministic::Context) -> (Output, Value) {
                 "admission_deadline": ADMISSION_DEADLINE,
                 "challenge_deadline": CHALLENGE_DEADLINE,
                 "finalize_at": FINALIZE_AT,
+            },
+            "recovery": {
+                "sweep_namespace": String::from_utf8(RECOVERY_SWEEP_NAMESPACE.to_vec()).unwrap(),
+                "sweep_recipient": hex(RECOVERY_RECIPIENT),
+                "sweep_nonce": 0,
+                "sweep_account": WITHDRAWER,
             },
         },
         "close": {

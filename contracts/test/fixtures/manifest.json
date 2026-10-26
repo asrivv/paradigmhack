@@ -483,6 +483,12 @@
       "file": "payout_opening.hex",
       "type": "logs::Opening<sha256::Digest>"
     },
+    "recovery_sweep_signature": {
+      "bytes": 64,
+      "description": "Account a's signature over union_unique(RECOVERY_SWEEP_NAMESPACE, deployment || recipient || u64 nonce 0) for BajillionSettlement.sweepRecovered.",
+      "file": "recovery_sweep_signature.hex",
+      "type": "curve25519::Signature"
+    },
     "root_bundle": {
       "bytes": 184,
       "description": "Validator-derived successor roots; the second part of the header preimage.",
@@ -494,6 +500,30 @@
       "description": "Settlement state immediately after admission, before finalization.",
       "file": "settlement_chain_admitted.hex",
       "type": "SettlementChain<Sha256, StrictVerifyingKey>"
+    },
+    "state_opening_a_genesis": {
+      "bytes": 270,
+      "description": "The account's balance opening at the genesis state root: account, u64 balance, then the current ordered QMDB membership proof over the MMB.",
+      "file": "state_opening_a_genesis.hex",
+      "type": "qmdb::StateOpening<StrictVerifyingKey, sha256::Digest>"
+    },
+    "state_opening_b_genesis": {
+      "bytes": 270,
+      "description": "The account's balance opening at the genesis state root: account, u64 balance, then the current ordered QMDB membership proof over the MMB.",
+      "file": "state_opening_b_genesis.hex",
+      "type": "qmdb::StateOpening<StrictVerifyingKey, sha256::Digest>"
+    },
+    "state_opening_c_genesis": {
+      "bytes": 270,
+      "description": "The account's balance opening at the genesis state root: account, u64 balance, then the current ordered QMDB membership proof over the MMB.",
+      "file": "state_opening_c_genesis.hex",
+      "type": "qmdb::StateOpening<StrictVerifyingKey, sha256::Digest>"
+    },
+    "state_opening_d_genesis": {
+      "bytes": 270,
+      "description": "The account's balance opening at the genesis state root: account, u64 balance, then the current ordered QMDB membership proof over the MMB.",
+      "file": "state_opening_d_genesis.hex",
+      "type": "qmdb::StateOpening<StrictVerifyingKey, sha256::Digest>"
     },
     "withdrawal_batch": {
       "bytes": 167,
@@ -792,6 +822,12 @@
         "to": "b"
       }
     ],
+    "recovery": {
+      "sweep_account": "a",
+      "sweep_namespace": "_PARADIGMHACK_BAJILLION_RECOVERY",
+      "sweep_nonce": 0,
+      "sweep_recipient": "0x000000000000000000000000000000000000a1a1"
+    },
     "settlement_config": {
       "admission_delay": 10,
       "challenge_duration": 20,
