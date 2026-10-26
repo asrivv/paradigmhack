@@ -418,6 +418,7 @@ commonware-sol, and how `contracts/src/BajillionSettlement.sol` resolves them.
 | Claimed ranges come from an authenticated ordered map | A linked list keyed by range start; the caller names the predecessor and the contract checks it in O(1) |
 | Unbounded queues of registrations and admitted closes | A 64-epoch ring; `registerEpoch` reverts with `PipelineFull` past it |
 | Clock | `block.timestamp` |
+| EIP-170: at the upstream 1,000,000 optimizer runs the contract is 29,051 bytes | `foundry.toml` compiles `BajillionSettlement.sol` alone at 200 runs (22,007 bytes). The linked verifier libraries keep 1,000,000 runs. `test/SettlementSize.t.sol` fails above 24,576 bytes |
 
 ### Behaviour inherited from commonware-sol
 

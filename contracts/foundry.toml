@@ -15,6 +15,12 @@ remappings = [
     "commonware/=lib/commonware/sol/src/",
     "forge-std/=lib/forge-std/src/",
 ]
+# BajillionSettlement alone compiles at 200 runs so it fits EIP-170 (24,576 bytes); at 1,000,000
+# runs it is 29,051 bytes. The linked verifier libraries it calls (BajillionChallenge,
+# AdmissionVerifier, CertificateVerifier, PayoutVerifier, Ed25519Verifier) are separate deployed
+# contracts and stay at the upstream 1,000,000 runs. SettlementSize.t.sol enforces the limit.
+additional_compiler_profiles = [{ name = "settlement", optimizer_runs = 200 }]
+compilation_restrictions = [{ paths = "src/BajillionSettlement.sol", optimizer_runs = 200 }]
 
 [profile.default.fuzz]
 runs = 1024
