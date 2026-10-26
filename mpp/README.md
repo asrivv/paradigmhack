@@ -65,7 +65,7 @@ endpoint means the wallet can no longer sign the next sequence number.
 | `src/Methods.ts` | The shared `Method.from` definition. |
 | `src/server`, `src/client` | `Method.toServer` and `Method.toClient` halves. |
 | `test/vectors/entry-receipts.json` | Receipts the crate built over the fixture acks (`test/vectors/receiptgen`). |
-| `test/vectors/ed25519-zip215.json` | The crate's Wycheproof verdicts and ZIP215 points. |
+| `test/vectors/ed25519-zip215.json` | The crate's Wycheproof verdicts and ZIP215 points (`test/vectors/extract-ed25519.py`). |
 
 ## Tests
 
@@ -84,4 +84,10 @@ To regenerate the receipt vectors (needs the `contracts/lib/commonware` submodul
 
 ```sh
 cd test/vectors/receiptgen && cargo run --release > ../entry-receipts.json
+```
+
+To regenerate the ed25519 vectors from the crate's own test vectors (needs the same submodule):
+
+```sh
+python3 -I test/vectors/extract-ed25519.py
 ```
