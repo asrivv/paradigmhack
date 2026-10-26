@@ -24,7 +24,9 @@ use commonware_clearing::bajillion::{
     logs::PayoutOperation,
     payment::{SendAuthorization, VECTOR_SEND_SIGNATURE_NAMESPACE, VectorAck, VectorSendBody},
     qmdb::{StateOpening, account_key},
-    settlement::{BatchStatus, Bounds, ClaimedRange, HardFaultReason, SettlementChain},
+    settlement::{
+        BatchStatus, Bounds, ClaimedRange, HardFaultReason, SettlementChain, SettlementError,
+    },
     transition::{
         BatchId, Close, CloseContext, CloseLimits, EpochContext, Header, PreparedClose, RootBundle,
         Terminal, WithdrawalClaim, WithdrawalOutput, prepare_close_with_strategy,
@@ -296,6 +298,12 @@ impl World {
         )
         .map_err(|_| status::MALFORMED_ARGS)?;
         let pulled = self.chain.pulled();
+        // The embedding supplies the aggregate of the pulled prefix (settlement.rs:14-16).
+        // Settlement keeps no per-deposit amounts, so it only asserts the batch never exceeds
+        // an account's unpulled total; an embedding that stores each deposit must supply it
+        // exactly, or a pulled deposit loses its inclusion deadline uncredited.
+        let exact = (pulled..=self.chain.intake()).contains(&end)
+            && deposits.encode() == self.deposits_between(pulled, end).encode();
 
         // Upstream panics when a root-consistent deposit batch credits an account more than its
         // unpulled deposits. Run the call on a copy so that caller precondition is reported as a
@@ -312,6 +320,13 @@ impl World {
         let Ok(result) = outcome else {
             return Err(status::PRECONDITION);
         };
+        // An inexact batch violates the same precondition from the point where upstream checks
+        // the batch against unpulled totals: after every boundary, anchor and intake check, so
+        // those errors still win. `EpochOverflow` before that point needs epoch 2^64 - 1; after
+        // it, only a carried withdrawal raises it.
+        if !exact && !result.as_ref().is_err_and(checked_before_deposits) {
+            return Err(status::PRECONDITION);
+        }
         self.chain = copy;
         result.map_err(|error| status::settlement(&error))?;
         // The embedding deletes the deposit records the registration pulled.
@@ -1100,6 +1115,24 @@ impl World {
         );
         Sha256::hash(&[&out]).as_ref().try_into().unwrap()
     }
+}
+
+/// Whether `register_epoch` returns `error` before it compares the deposit batch with unpulled
+/// totals (settlement.rs:1263-1288).
+fn checked_before_deposits(error: &SettlementError) -> bool {
+    matches!(
+        error,
+        SettlementError::OperatorHardFaulted
+            | SettlementError::Deployment
+            | SettlementError::OperatorMismatch
+            | SettlementError::EpochSequence
+            | SettlementError::EpochOverflow
+            | SettlementError::CommitteeMismatch
+            | SettlementError::IntakeRange
+            | SettlementError::BoundaryRoot
+            | SettlementError::Commitment(_)
+            | SettlementError::Transition(_)
+    )
 }
 
 fn kind_code(kind: ChallengeKind) -> u8 {

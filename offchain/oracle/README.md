@@ -107,10 +107,14 @@ The oracle plays the role of the embedding contract around `SettlementChain`:
   `claimWithdrawal` passes the range at or before the claim position and the first range
   starting strictly after it; on success the merged range replaces them. A successful
   `finalize` also records the trailing Commit location it returns as claimed, the same way.
-- `registerEpoch`: upstream panics (a documented caller precondition) when a root-consistent
-  deposit batch credits an account more than its unpulled deposits. The oracle runs the call on
-  a copy of the state and reports 1004 with nothing applied. The contract must revert without
-  any state change for that input.
+- `registerEpoch`: the embedding supplies the aggregate of the pulled prefix
+  (`settlement.rs:14-16`), so the deposit batch must be exactly the per-account sum of the
+  stored deposits at `[pulled, end)`. Upstream checks only part of this: it panics (a
+  documented caller precondition) when a root-consistent batch credits an account more than its
+  unpulled deposits, and it cannot see a batch that credits less. The oracle runs the call on a
+  copy of the state and reports 1004 with nothing applied for either violation, at the point
+  where upstream checks the batch: every earlier boundary, anchor and intake error still wins.
+  The contract must revert without any state change for that input.
 
 ### Materialized args
 
@@ -227,7 +231,7 @@ The oracle codes mean:
   value inside them does not decode, or `finalize`/`faultExpired` got non-empty args.
 - 1002 `UnknownKind`: `kind` is 9 or greater.
 - 1003 `ClockOverflow`: `advanceTime` would overflow the 64-bit clock; `now` is unchanged.
-- 1004 `Precondition`: the `registerEpoch` caller precondition above.
+- 1004 `Precondition`: the `registerEpoch` deposit-aggregate precondition above.
 
 ## State digest
 
