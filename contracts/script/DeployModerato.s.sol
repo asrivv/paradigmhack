@@ -37,6 +37,7 @@ contract DeployModerato is ModeratoBase {
     }
 
     Lib[] internal libs;
+
     /// @dev `PLAN_FILE` overrides the plan path, so a local replay keeps its own plan.
     function _planFile() internal view returns (string memory) {
         return vm.envOr("PLAN_FILE", string("../deployments/moderato.plan.json"));

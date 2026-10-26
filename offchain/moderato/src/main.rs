@@ -26,7 +26,9 @@ use commonware_clearing::bajillion::{
     logs::PayoutOperation,
     payment::SendAuthorization,
     settlement::{EpochDeadlinePolicy, SettlementChain, SettlementConfig},
-    transition::{CloseLimits, EpochContext, Header, Terminal, WithdrawalClaim, prepare_close_with_strategy},
+    transition::{
+        CloseLimits, EpochContext, Header, Terminal, WithdrawalClaim, prepare_close_with_strategy,
+    },
     vector::{OutEntry, OutVector},
 };
 use commonware_codec::Encode;
@@ -58,12 +60,19 @@ pub const MAX_DESTINATION_BYTES: usize = 256;
 pub const MAX_DEPOSIT_IDS: usize = 1_024;
 
 /// The fixture epoch's payments and withdrawal (offchain/fixtures/src/main.rs).
-const PAYMENTS: [(&str, &str, u64); 6] =
-    [("a", "b", 20), ("b", "c", 12), ("c", "d", 7), ("d", "a", 5), ("c", "b", 4), ("d", "b", 6)];
+const PAYMENTS: [(&str, &str, u64); 6] = [
+    ("a", "b", 20),
+    ("b", "c", 12),
+    ("c", "d", 7),
+    ("d", "a", 5),
+    ("c", "b", 4),
+    ("d", "b", 6),
+];
 const WITHDRAWER: &str = "a";
 const WITHDRAWAL_AMOUNT: u64 = 10;
-const WITHDRAWAL_DESTINATION: [u8; 20] =
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xa1, 0x1c];
+const WITHDRAWAL_DESTINATION: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xa1, 0x1c,
+];
 const SIGNING_VALIDATORS: [usize; 3] = [0, 2, 3];
 
 type Chain = SettlementChain<Sha256, Key>;
@@ -83,7 +92,14 @@ fn config() -> SettlementConfig {
 }
 
 /// The registration inputs: the withdrawal signed for `deadline`.
-fn boundary(fixture: &Deployment, deadline: u64) -> (EpochContext<Key, Digest>, DepositBatch<Key>, WithdrawalBatch<Key, Digest>) {
+fn boundary(
+    fixture: &Deployment,
+    deadline: u64,
+) -> (
+    EpochContext<Key, Digest>,
+    DepositBatch<Key>,
+    WithdrawalBatch<Key, Digest>,
+) {
     let withdrawal = SignedWithdrawal::sign(
         fixture.deployment,
         Bytes::copy_from_slice(&WITHDRAWAL_DESTINATION),
@@ -113,7 +129,9 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
             .and_then(|i| args.get(i + 1))
             .and_then(|value| value.parse().ok())
     };
-    let command = args.first().ok_or("usage: bajillion-moderato <epoch|close> --deadline D [--registered-at T]")?;
+    let command = args
+        .first()
+        .ok_or("usage: bajillion-moderato <epoch|close> --deadline D [--registered-at T]")?;
     let deadline = flag("--deadline").ok_or("--deadline is required")?;
     let fixture = Deployment::new(FIXTURE_SEED);
     let (epoch_context, deposits, withdrawals) = boundary(&fixture, deadline);
@@ -145,7 +163,14 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
         )
         .map_err(|e| format!("chain: {e:?}"))?;
         chain
-            .register_epoch(registered_at, epoch_context, 0, deposits.clone(), withdrawals.clone(), |_| true)
+            .register_epoch(
+                registered_at,
+                epoch_context,
+                0,
+                deposits.clone(),
+                withdrawals.clone(),
+                |_| true,
+            )
             .map_err(|e| format!("register_epoch at {registered_at}: {e:?}"))?;
         let close_context = chain.registered().unwrap().context.clone();
 
@@ -157,18 +182,32 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
             let payer = fixture.account(from);
             let recipient = fixture.account(to).key.clone();
             let entries = vectors.entry(from).or_default();
-            match entries.iter_mut().find(|entry| entry.recipient == recipient) {
+            match entries
+                .iter_mut()
+                .find(|entry| entry.recipient == recipient)
+            {
                 Some(entry) => {
                     entry.cumulative += amount;
                     entry.count += 1;
                 }
-                None => entries.push(OutEntry { recipient, cumulative: amount, count: 1 }),
+                None => entries.push(OutEntry {
+                    recipient,
+                    cumulative: amount,
+                    count: 1,
+                }),
             }
             entries.sort_unstable_by(|a, b| a.recipient.cmp(&b.recipient));
             let vector = OutVector::new(EPOCH, payer.key.clone(), entries.clone()).unwrap();
             let debit = vector.totals().unwrap().0;
             let seq = seqs.entry(from).or_default();
-            let ack = acknowledge(&close_context, &payer.signer, &fixture.operator, &vector, *seq, debit);
+            let ack = acknowledge(
+                &close_context,
+                &payer.signer,
+                &fixture.operator,
+                &vector,
+                *seq,
+                debit,
+            );
             *seq += 1;
             last.insert(from, ack);
         }
@@ -183,12 +222,17 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
                         ack.predecessor(),
                         ack.payer_signature().clone(),
                     ),
-                    vector: OutVector::new(EPOCH, payer.key.clone(), vectors[payer.name].clone()).unwrap(),
+                    vector: OutVector::new(EPOCH, payer.key.clone(), vectors[payer.name].clone())
+                        .unwrap(),
                 })
             })
             .collect::<Vec<_>>();
         terminals.sort_unstable_by(|a, b| {
-            a.authorization.body().payer().as_ref().cmp(b.authorization.body().payer().as_ref())
+            a.authorization
+                .body()
+                .payer()
+                .as_ref()
+                .cmp(b.authorization.body().payer().as_ref())
         });
 
         let prepared = prepare_close_with_strategy::<Sha256, _, _, _, _>(
@@ -210,8 +254,13 @@ fn run(args: &[String]) -> Result<serde_json::Value, String> {
             .admit(registered_at, header, roots, total, certificate.clone())
             .map_err(|e| format!("admit: {e:?}"))?;
         let finalize_at = close_context.challenge_deadline() + 1;
-        chain.finalize(finalize_at).map_err(|e| format!("finalize: {e:?}"))?;
-        let (replica, _) = prepared.apply::<_, Sha256>(replica).await.map_err(|e| format!("apply: {e:?}"))?;
+        chain
+            .finalize(finalize_at)
+            .map_err(|e| format!("finalize: {e:?}"))?;
+        let (replica, _) = prepared
+            .apply::<_, Sha256>(replica)
+            .await
+            .map_err(|e| format!("apply: {e:?}"))?;
 
         // The one payout: the withdrawal's output, the first append after the bootstrap commit.
         let head = chain.finalized_payouts();
@@ -252,10 +301,16 @@ fn certify(fixture: &Deployment, header: &Header<Digest>) -> bls12381::Certifica
         .iter()
         .map(|index| fixture.signer(*index).sign(header).unwrap())
         .collect::<Vec<_>>();
-    let signatures = votes.iter().map(|vote| *vote.signature.get().unwrap()).collect::<Vec<_>>();
+    let signatures = votes
+        .iter()
+        .map(|vote| *vote.signature.get().unwrap())
+        .collect::<Vec<_>>();
     bls12381::Certificate {
         signers: Signers::new(VALIDATORS as u32, votes.iter().map(|vote| vote.signer)).unwrap(),
-        signature: aggregate::combine_signatures::<MinSig, _>(NonEmpty::try_new(signatures.iter()).unwrap()).into(),
+        signature: aggregate::combine_signatures::<MinSig, _>(
+            NonEmpty::try_new(signatures.iter()).unwrap(),
+        )
+        .into(),
     }
 }
 
