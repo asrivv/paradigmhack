@@ -10,6 +10,8 @@ evm_version = "prague"
 optimizer = true
 optimizer_runs = 1000000
 via_ir = true
+# As upstream sol/foundry.toml: differential tests need FFI and run only in their own profile.
+no_match_test = "test(Fuzz)?_Differential"
 fs_permissions = [{ access = "read", path = "./test/fixtures" }, { access = "read", path = "./test/vectors" }]
 remappings = [
     "commonware/=lib/commonware/sol/src/",
@@ -30,6 +32,16 @@ seed = "0x2a"
 runs = 256
 depth = 64
 fail_on_revert = false
+
+# Differential tests against the crate's SettlementChain through the offchain/oracle binary
+# (test/Differential.t.sol). Build it first: `cargo build --release --locked -p bajillion-oracle`
+# in offchain/. Inherits every compiler setting from the default profile.
+[profile.differential]
+ffi = true
+no_match_test = "test_unused"
+
+[profile.differential.fuzz]
+runs = 1000
 
 [fmt]
 bracket_spacing = true
